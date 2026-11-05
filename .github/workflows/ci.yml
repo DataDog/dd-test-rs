@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly canary: the harness uses unstable libtest internals.
+    - cron: "0 5 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (harness on ${{ matrix.toolchain }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: ["1.81", stable, beta, nightly]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable ${{ matrix.toolchain }} --profile minimal --no-self-update
+      # The wrapper and agent build on stable (MSRV 1.88). The end-to-end test
+      # builds fixtures/basic, and with it the harness, on the matrix toolchain.
+      - run: cargo +stable test --workspace --locked
+        env:
+          DD_TEST_E2E_TOOLCHAIN: ${{ matrix.toolchain }}
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.88 --profile minimal --no-self-update
+      - run: cargo +1.88 build --workspace --locked
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: rustfmt --check --edition 2021 --config-path rustfmt.toml crates/dd-test-harness/src/lib.rs
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check license headers
+        run: |
+          missing=$(git ls-files '*.rs' | xargs grep -L '^// SPDX-License-Identifier: Apache-2.0$' || true)
+          if [ -n "$missing" ]; then
+            echo "Files without a license header:"
+            echo "$missing"
+            exit 1
+          fi
+      - run: cargo install dd-rust-license-tool --version 1.0.6 --locked
+      - run: dd-rust-license-tool check
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

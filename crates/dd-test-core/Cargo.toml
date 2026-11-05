@@ -1,0 +1,11 @@
+[package]
+name = "dd-test-core"
+description = "Datadog Test Optimization logic compiled into instrumented Rust test binaries (std only)"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.81"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "dd_test_core"
