@@ -28,6 +28,8 @@ const MAX_BACKOFF: Duration = Duration::from_millis(20);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Also the longest TTL, so older files are never fresh.
 const STALE_AFTER: Duration = Duration::from_secs(3600);
+/// Far longer than a takeover takes, so an older guard belongs to a dead agent.
+const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_MAX_ENTRIES: usize = 32;
 const CLEANUP_MAX_DURATION: Duration = Duration::from_millis(5);
 
@@ -294,7 +296,8 @@ pub fn default_dir() -> PathBuf {
         .join("read-cache")
 }
 
-/// Matches the names the cache writes: `<key>.json`, `<key>.lock` and `<key>.tmp.<pid>.<nonce>`.
+/// Matches the names the cache writes: `<key>.json`, `<key>.lock`, `<key>.takeover`
+/// and `<key>.tmp.<pid>.<nonce>`.
 fn is_cache_file(name: &str) -> bool {
     let Some((key, suffix)) = name.split_once('.') else {
         return false;
@@ -305,7 +308,7 @@ fn is_cache_file(name: &str) -> bool {
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(pid, nonce)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && hex(nonce))
     };
-    key.len() == 64 && hex(key) && (suffix == "json" || suffix == "lock" || temp(suffix))
+    key.len() == 64 && hex(key) && (matches!(suffix, "json" | "lock" | "takeover") || temp(suffix))
 }
 
 fn acquire(path: &Path) -> Acquire {
@@ -319,42 +322,72 @@ fn acquire(path: &Path) -> Acquire {
         Ok(false) => {}
         Err(_) => return Acquire::Bypass,
     }
-    if !is_stale(path) {
-        return Acquire::Held;
-    }
-    debug!("read_cache: owner gone, taking over [lock:{}]", path.display());
-    let _ = fs::remove_file(path);
-    match try_lock(path, &lock) {
-        Ok(true) => Acquire::Owner(lock),
-        Ok(false) => Acquire::Held,
-        Err(_) => Acquire::Bypass,
+    match fs::read(path) {
+        Ok(current) if is_stale(&current) => take_over(path, &current, lock),
+        _ => Acquire::Held,
     }
 }
 
-fn try_lock(path: &Path, lock: &Lock) -> std::io::Result<bool> {
-    let bytes = serde_json::to_vec(lock).map_err(std::io::Error::other)?;
-    match write_new(path, &bytes) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => {
-            let _ = fs::remove_file(path);
-            Err(error)
-        }
-    }
-}
-
-/// A lock is stale when its owner no longer runs or it is older than any request.
-fn is_stale(path: &Path) -> bool {
-    match fs::read(path)
-        .ok()
-        .and_then(|text| serde_json::from_slice::<Lock>(&text).ok())
-    {
-        Some(lock) => !process_alive(lock.pid) || now_nanos() - lock.created_at > STALE_AFTER.as_nanos() as i64,
-        None => fs::metadata(path)
+/// Replaces a stale lock in place while holding a takeover guard, so only one
+/// agent replaces it and the lock never disappears for the waiters.
+fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
+    let guard = path.with_extension("takeover");
+    if write_new(&guard, &[]).is_err() {
+        let abandoned = fs::metadata(&guard)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > STALE_AFTER),
+            .is_some_and(|age| age > TAKEOVER_TIMEOUT);
+        if abandoned {
+            let _ = fs::remove_file(&guard);
+        }
+        return Acquire::Held;
+    }
+    let result = if fs::read(path).ok().as_deref() == Some(stale) {
+        debug!("read_cache: owner gone, taking over [lock:{}]", path.display());
+        replace(path, &lock).map_or(Acquire::Bypass, |()| Acquire::Owner(lock))
+    } else {
+        Acquire::Held
+    };
+    let _ = fs::remove_file(&guard);
+    result
+}
+
+fn replace(path: &Path, lock: &Lock) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(lock).map_err(std::io::Error::other)?;
+    let temp = temp_path(path);
+    write_new(&temp, &bytes)?;
+    fs::rename(&temp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temp);
+    })
+}
+
+/// Publishes a complete lock file with a link that fails when the lock exists.
+fn try_lock(path: &Path, lock: &Lock) -> std::io::Result<bool> {
+    let bytes = serde_json::to_vec(lock).map_err(std::io::Error::other)?;
+    let temp = temp_path(path);
+    write_new(&temp, &bytes)?;
+    let linked = fs::hard_link(&temp, path);
+    let _ = fs::remove_file(&temp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// A unique `<key>.tmp.<pid>.<nonce>` path next to a `<key>.lock` path.
+fn temp_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension(format!("tmp.{}.{:x}", std::process::id(), new_id()))
+}
+
+/// A lock is stale when it is unreadable, its owner no longer runs, or it is
+/// older than any request. Locks are published complete, so an unreadable lock
+/// has no owner.
+fn is_stale(content: &[u8]) -> bool {
+    match serde_json::from_slice::<Lock>(content) {
+        Ok(lock) => !process_alive(lock.pid) || now_nanos() - lock.created_at > STALE_AFTER.as_nanos() as i64,
+        Err(_) => true,
     }
 }
 
@@ -602,7 +635,12 @@ mod tests {
     #[test]
     fn recognizes_its_own_files() {
         let key = "a".repeat(64);
-        for name in [format!("{key}.json"), format!("{key}.lock"), format!("{key}.tmp.42.1f")] {
+        for name in [
+            format!("{key}.json"),
+            format!("{key}.lock"),
+            format!("{key}.takeover"),
+            format!("{key}.tmp.42.1f"),
+        ] {
             assert!(is_cache_file(&name), "{name}");
         }
         for name in [
@@ -633,6 +671,49 @@ mod tests {
         cache(&dir).cleanup_within(Duration::MAX);
         assert!(dir.join("keep-me.txt").exists() && dir.join("notes.json").exists());
         assert!(!expired.exists(), "other files do not use up the cleanup budget");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn takes_over_an_incomplete_lock() {
+        let dir = temp_dir("incomplete");
+        let cache = cache(&dir);
+        create_dir(&dir).unwrap();
+        let lock_path = dir.join(format!("{}.lock", cache.key("/p", &request("a"))));
+        File::create(&lock_path).unwrap();
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        fetch(&cache, &request("a"), &calls).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cache.read(&cache.key("/p", &request("a"))).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_one_agent_takes_over_a_stale_lock() {
+        let dir = temp_dir("takeover");
+        create_dir(&dir).unwrap();
+        let path = dir.join("k.lock");
+        let stale = b"stale".to_vec();
+        fs::write(&path, &stale).unwrap();
+        let Acquire::Owner(first) = acquire(&path) else {
+            panic!("the first agent takes over");
+        };
+        let second = Lock {
+            pid: std::process::id(),
+            created_at: now_nanos(),
+            nonce: new_id(),
+        };
+        assert!(matches!(take_over(&path, &stale, second), Acquire::Held));
+        let current: Lock = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(current == first);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+        fs::write(&path, &stale).unwrap();
+        File::create(path.with_extension("takeover")).unwrap();
+        assert!(matches!(acquire(&path), Acquire::Held));
+        assert_eq!(fs::read(&path).unwrap(), stale);
         let _ = fs::remove_dir_all(&dir);
     }
 
