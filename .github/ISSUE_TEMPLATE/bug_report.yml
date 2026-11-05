@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible problem with dd-test-rs.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For issues with the Datadog service or UI, contact [Datadog support](https://docs.datadoghq.com/help/) instead.
+        Remove secrets, such as your API key, from everything you paste.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe what you observed and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: The commands and the smallest project that reproduce the problem.
+    validations:
+      required: true
+  - type: input
+    id: wrapper-version
+    attributes:
+      label: dd-test-wrapper version or commit
+      placeholder: "0.1.0 or a commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: rustc-version
+    attributes:
+      label: Output of `rustc --version`
+      placeholder: "rustc 1.88.0 (6b00bc388 2025-06-23)"
+    validations:
+      required: true
+  - type: dropdown
+    id: runner
+    attributes:
+      label: Test runner
+      options:
+        - cargo test
+        - cargo nextest
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, CI provider, and other tools such as sccache.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Output of the test run with `DD_TRACE_DEBUG=true`.
+      render: text

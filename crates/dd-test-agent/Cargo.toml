@@ -1,0 +1,25 @@
+[package]
+name = "dd-test-agent"
+description = "Datadog Test Optimization agent: backend requests, event encoding and transport for dd-test-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dd-test-core = { path = "../dd-test-core", version = "0.1.0" }
+flate2 = "1"
+libdd-http-client = "2"
+ring = "0.17"
+rmp-serde = "1.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "time"] }
+libdd-capabilities-impl = "6"
+libdd-common = { version = "7", default-features = false }
+libdd-telemetry = { version = "9", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

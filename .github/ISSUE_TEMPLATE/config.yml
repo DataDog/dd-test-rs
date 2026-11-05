@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Datadog support
+    url: https://docs.datadoghq.com/help/
+    about: Get help with the Datadog service, the UI, or your account.
+  - name: Security vulnerability
+    url: https://github.com/DataDog/dd-test-rs/security/advisories/new
+    about: Report security vulnerabilities privately.
