@@ -1,5 +1,8 @@
 # Datadog Test Optimization for Rust
 
+> [!NOTE]
+> This library is in Preview. Features, settings, and behavior may change before general availability. To report a problem or give feedback, [open an issue](https://github.com/DataDog/dd-test-rs/issues/new/choose).
+
 Datadog's Rust library for instrumenting your tests. It reports tests that run with `cargo test` or `cargo nextest` to [Datadog Test Optimization](https://docs.datadoghq.com/tests/), without changes to your tests or your `Cargo.toml`.
 
 The library ships as `dd-test-wrapper`, a `RUSTC_WORKSPACE_WRAPPER`. When Cargo compiles a test binary, the wrapper builds it with a test harness that reports every test to Datadog and applies the features enabled for your repository.
