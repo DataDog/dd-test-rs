@@ -17,6 +17,7 @@ use tokio::runtime::Runtime;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const ATTEMPTS: u32 = 3;
+const MAX_ERROR_BODY_CHARS: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intake {
@@ -44,6 +45,20 @@ impl RequestError {
     fn other(message: String) -> RequestError {
         RequestError { status: None, message }
     }
+}
+
+/// Truncates an error response body and escapes control characters, so a
+/// response cannot add lines or terminal sequences to the log.
+fn printable_body(body: &str) -> String {
+    let mut printable: String = body
+        .chars()
+        .take(MAX_ERROR_BODY_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if body.chars().nth(MAX_ERROR_BODY_CHARS).is_some() {
+        printable.push_str("...");
+    }
+    printable
 }
 
 impl std::fmt::Display for RequestError {
@@ -188,7 +203,7 @@ impl Transport {
                 Err(HttpClientError::RequestFailed { status, body }) => {
                     last_error = RequestError {
                         status: Some(status),
-                        message: format!("{url} returned {status}: {body}"),
+                        message: format!("{url} returned {status}: {}", printable_body(&body)),
                     };
                     status >= 500 || status == 429
                 }
@@ -327,6 +342,17 @@ mod tests {
         assert_eq!(post(&transport).unwrap_err().status, Some(503));
         assert_eq!(connections.load(Ordering::SeqCst), ATTEMPTS as usize);
         assert!(!transport.is_unreachable(Intake::TestCycle));
+    }
+
+    #[test]
+    fn error_bodies_are_escaped_and_truncated() {
+        assert_eq!(printable_body("bad\nrequest\u{1b}[2J"), "bad\\nrequest\\u{1b}[2J");
+        let long = "x".repeat(MAX_ERROR_BODY_CHARS + 1);
+        assert_eq!(
+            printable_body(&long),
+            format!("{}...", "x".repeat(MAX_ERROR_BODY_CHARS))
+        );
+        assert_eq!(printable_body("not found"), "not found");
     }
 
     /// Answers every request with 200, keeping connections open. Counts connections and requests.
