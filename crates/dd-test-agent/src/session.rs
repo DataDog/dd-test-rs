@@ -148,7 +148,7 @@ impl AgentSession {
                 .filter_map(|(key, value)| Some((key.strip_prefix("test.configuration.")?.to_string(), value.clone())))
                 .collect(),
         };
-        let transport = match Transport::new(&config) {
+        let transport = match Transport::new(&config, cache.clone()) {
             Ok(transport) => {
                 transport.warm_up(Intake::TestCycle);
                 Some(transport)

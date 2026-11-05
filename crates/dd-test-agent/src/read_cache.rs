@@ -28,6 +28,8 @@ const MAX_BACKOFF: Duration = Duration::from_millis(20);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Also the longest TTL, so older files are never fresh.
 const STALE_AFTER: Duration = Duration::from_secs(3600);
+/// Short, so one timeout does not stop reporting for long.
+const UNREACHABLE_TTL: Duration = Duration::from_secs(300);
 const CLEANUP_MAX_ENTRIES: usize = 32;
 const CLEANUP_MAX_DURATION: Duration = Duration::from_millis(5);
 
@@ -78,6 +80,7 @@ impl Scope {
     }
 }
 
+#[derive(Clone)]
 pub struct ReadCache {
     dir: PathBuf,
     ttl: Duration,
@@ -136,7 +139,7 @@ impl ReadCache {
             debug!("read_cache: bypass [endpoint:{endpoint} error:{error}]");
             return live();
         }
-        if let Some(hit) = self.read(&key) {
+        if let Some(hit) = self.read(&key, self.ttl) {
             debug!("read_cache: hit [endpoint:{endpoint} key:{key}]");
             return Ok(hit);
         }
@@ -147,7 +150,7 @@ impl ReadCache {
         loop {
             match acquire(&lock_path, waiting) {
                 Acquire::Owner(lock) => {
-                    let result = match self.read(&key) {
+                    let result = match self.read(&key, self.ttl) {
                         Some(hit) => {
                             debug!("read_cache: hit [endpoint:{endpoint} key:{key}]");
                             Ok(hit)
@@ -155,7 +158,7 @@ impl ReadCache {
                         None => {
                             let result = live();
                             if let Ok((response, bytes)) = &result {
-                                self.write(&key, &lock, response, *bytes);
+                                self.write(&key, self.ttl, response, *bytes);
                             }
                             debug!(
                                 "read_cache: miss [endpoint:{endpoint} key:{key} stored:{}]",
@@ -183,7 +186,7 @@ impl ReadCache {
             }
             std::thread::sleep(backoff);
             backoff = (backoff * 2).min(MAX_BACKOFF);
-            if let Some(hit) = self.read(&key) {
+            if let Some(hit) = self.read(&key, self.ttl) {
                 debug!(
                     "read_cache: hit after wait [endpoint:{endpoint} key:{key} waited:{:?}]",
                     started.elapsed()
@@ -191,7 +194,7 @@ impl ReadCache {
                 return Ok(hit);
             }
             if !lock_path.exists() {
-                if let Some(hit) = self.read(&key) {
+                if let Some(hit) = self.read(&key, self.ttl) {
                     return Ok(hit);
                 }
                 debug!(
@@ -213,27 +216,49 @@ impl ReadCache {
         sha256(text.as_bytes())
     }
 
-    fn read(&self, key: &str) -> Option<(Value, usize)> {
+    /// Tells the other agents of the scope that `host` did not answer.
+    pub fn mark_unreachable(&self, host: &str) {
+        if create_dir(&self.dir).is_ok() {
+            self.write(
+                &self.key("unreachable", &json!(host)),
+                self.unreachable_ttl(),
+                &Value::Null,
+                0,
+            );
+        }
+    }
+
+    /// True when an agent of the scope recently found `host` unreachable.
+    pub fn is_unreachable(&self, host: &str) -> bool {
+        self.read(&self.key("unreachable", &json!(host)), self.unreachable_ttl())
+            .is_some()
+    }
+
+    fn unreachable_ttl(&self) -> Duration {
+        self.ttl.min(UNREACHABLE_TTL)
+    }
+
+    fn read(&self, key: &str, ttl: Duration) -> Option<(Value, usize)> {
         let text = fs::read(self.dir.join(format!("{key}.json"))).ok()?;
         let entry: Entry = serde_json::from_slice(&text).ok()?;
         let age = now_nanos() - entry.created_at;
-        let fresh = entry.key == key
-            && entry.ttl_seconds == self.ttl.as_secs()
-            && age >= 0
-            && (age as u128) <= self.ttl.as_nanos();
+        let fresh =
+            entry.key == key && entry.ttl_seconds == ttl.as_secs() && age >= 0 && (age as u128) <= ttl.as_nanos();
         fresh.then_some((entry.response, entry.bytes))
     }
 
-    fn write(&self, key: &str, lock: &Lock, response: &Value, bytes: usize) {
+    fn write(&self, key: &str, ttl: Duration, response: &Value, bytes: usize) {
         let entry = Entry {
             key: key.to_string(),
             created_at: now_nanos(),
-            ttl_seconds: self.ttl.as_secs(),
+            ttl_seconds: ttl.as_secs(),
             bytes,
             response: response.clone(),
         };
         let path = self.dir.join(format!("{key}.json"));
-        let temp = self.dir.join(format!("{key}.tmp.{}.{:x}", lock.pid, lock.nonce));
+        let temp = self
+            .dir
+            .join(format!("{key}.tmp.{}.{:x}", std::process::id(), new_id()));
         let result = serde_json::to_vec(&entry)
             .map_err(|e| e.to_string())
             .and_then(|bytes| write_new(&temp, &bytes).map_err(|e| e.to_string()))
@@ -628,7 +653,7 @@ mod tests {
         releaser.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(
-            cache.read(&cache.key("/p", &request("a"))).is_none(),
+            cache.read(&cache.key("/p", &request("a")), cache.ttl).is_none(),
             "waiters do not store"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -655,7 +680,7 @@ mod tests {
         fetch(&cache, &request("a"), &calls).unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(cache.read(&cache.key("/p", &request("a"))).is_some());
+        assert!(cache.read(&cache.key("/p", &request("a")), cache.ttl).is_some());
         assert!(!lock_path.exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -710,7 +735,7 @@ mod tests {
         fetch(&cache, &request("a"), &calls).unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(cache.read(&cache.key("/p", &request("a"))).is_some());
+        assert!(cache.read(&cache.key("/p", &request("a")), cache.ttl).is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 

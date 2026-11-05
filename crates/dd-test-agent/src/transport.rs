@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::read_cache::ReadCache;
 use dd_test_core::debug;
 use dd_test_core::warn;
 use flate2::write::GzEncoder;
@@ -74,11 +75,45 @@ pub struct Transport {
     site: String,
     intake_url: Option<String>,
     timeout: Duration,
-    unreachable: Mutex<HashSet<String>>,
+    unreachable: Arc<Unreachable>,
+}
+
+/// The hosts that did not answer. Timeouts are shared through the read cache
+/// with the other agents of the run, so they do not wait for the same timeout.
+struct Unreachable {
+    hosts: Mutex<HashSet<String>>,
+    cache: Option<ReadCache>,
+}
+
+impl Unreachable {
+    fn contains(&self, host: &str) -> bool {
+        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if hosts.contains(host) {
+            return true;
+        }
+        let shared = self.cache.as_ref().is_some_and(|cache| cache.is_unreachable(host));
+        if shared {
+            warn!("{host} did not answer another test binary of this run, no requests are sent to it");
+            hosts.insert(host.to_string());
+        }
+        shared
+    }
+
+    fn mark(&self, host: &str, error: &HttpClientError, url: &str) {
+        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        if hosts.insert(host.to_string()) {
+            warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
+            if matches!(error, HttpClientError::TimedOut) {
+                if let Some(cache) = &self.cache {
+                    cache.mark_unreachable(host);
+                }
+            }
+        }
+    }
 }
 
 impl Transport {
-    pub fn new(config: &Config) -> Result<Transport, String> {
+    pub fn new(config: &Config, cache: Option<ReadCache>) -> Result<Transport, String> {
         static CRYPTO: Once = Once::new();
         CRYPTO.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -104,7 +139,10 @@ impl Transport {
             site: config.site.clone(),
             intake_url: config.intake_url.clone(),
             timeout: TIMEOUT,
-            unreachable: Mutex::new(HashSet::new()),
+            unreachable: Arc::new(Unreachable {
+                hosts: Mutex::new(HashSet::new()),
+                cache,
+            }),
         })
     }
 
@@ -115,21 +153,11 @@ impl Transport {
     }
 
     fn is_host_unreachable(&self, host: &str) -> bool {
-        self.unreachable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(host)
+        self.unreachable.contains(host)
     }
 
     fn mark_unreachable(&self, host: &str, error: &HttpClientError, url: &str) {
-        if self
-            .unreachable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(host.to_string())
-        {
-            warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
-        }
+        self.unreachable.mark(host, error, url);
     }
 
     /// The scheme and host requests for `intake` go to.
@@ -140,16 +168,24 @@ impl Transport {
     }
 
     /// Opens the connection to the host serving `intake` in the background, so
-    /// the first request to it does not wait for TCP and TLS setup.
+    /// the first request to it does not wait for TCP and TLS setup. A timeout
+    /// marks the host unreachable.
     pub fn warm_up(&self, intake: Intake) {
+        let host = self.host(intake);
+        if self.is_host_unreachable(&host) {
+            return;
+        }
         let client = Arc::clone(&self.client);
-        let url = format!("{}/", self.host(intake));
+        let unreachable = Arc::clone(&self.unreachable);
+        let url = format!("{host}/");
         let request = HttpRequest::new(HttpMethod::Head, url.clone())
             .with_headers([("dd-api-key".to_string(), self.api_key.clone())])
             .with_timeout(self.timeout);
         self.runtime.spawn(async move {
             let started = Instant::now();
-            let _ = client.send(request).await;
+            if let Err(error @ HttpClientError::TimedOut) = client.send(request).await {
+                unreachable.mark(&host, &error, &url);
+            }
             debug!("opened the connection to {url} in {:?}", started.elapsed());
         });
     }
@@ -262,7 +298,7 @@ mod tests {
             "DD_CIVISIBILITY_AGENTLESS_URL" => intake_url.clone(),
             _ => None,
         });
-        let mut transport = Transport::new(&config).unwrap();
+        let mut transport = Transport::new(&config, None).unwrap();
         transport.timeout = Duration::from_millis(200);
         transport
     }
@@ -427,6 +463,64 @@ mod tests {
         transport.mark_unreachable(&transport.host(Intake::Api), &HttpClientError::TimedOut, "u");
         assert!(transport.is_unreachable(Intake::Api));
         assert!(!transport.is_unreachable(Intake::TestCycle));
+    }
+
+    fn shared(url: &str, dir: &std::path::Path) -> Transport {
+        let config = Config::from_lookup(|key| match key {
+            "DD_API_KEY" => Some("k".into()),
+            "DD_CIVISIBILITY_AGENTLESS_URL" => Some(url.to_string()),
+            _ => None,
+        });
+        let scope = crate::read_cache::Scope::select(&crate::ci::Tags::new(), None, Some(1)).unwrap();
+        let cache = ReadCache::new(dir.to_path_buf(), &scope, &config, "0");
+        let mut transport = Transport::new(&config, Some(cache)).unwrap();
+        transport.timeout = Duration::from_millis(200);
+        transport
+    }
+
+    fn cache_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dd-test-transport-{name}-{:x}", crate::ids::new_id()))
+    }
+
+    #[test]
+    fn timeouts_are_shared_with_the_other_agents() {
+        let (url, connections) = server(None);
+        let dir = cache_dir("timeout");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let other = shared(&url, &dir);
+        assert!(other.is_unreachable(Intake::TestCycle));
+        assert!(post(&other).unwrap_err().message.contains("skipped"));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_connections_are_not_shared() {
+        let url = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let dir = cache_dir("refused");
+        let first = shared(&url, &dir);
+        assert!(post(&first).is_err());
+        assert!(first.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_warm_up_timeout_marks_the_host_unreachable() {
+        let (url, _) = server(None);
+        let dir = cache_dir("warm-up");
+        let transport = shared(&url, &dir);
+        transport.warm_up(Intake::TestCycle);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !transport.is_unreachable(Intake::TestCycle) {
+            assert!(Instant::now() < deadline, "the warm-up times out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
