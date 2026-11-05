@@ -25,12 +25,22 @@ Features are turned on and off in Datadog, in the Test Optimization settings of 
 
 ## Installation
 
-Prebuilt binaries for Linux and macOS are attached to each [GitHub release](https://github.com/DataDog/dd-test-rs/releases). For example, with `curl`:
+Each [GitHub release](https://github.com/DataDog/dd-test-rs/releases) has an archive for each platform:
+
+| Platform | Archive |
+| --- | --- |
+| Linux x86-64 | `dd-test-wrapper-linux-amd64.tar.gz` |
+| Linux ARM64 | `dd-test-wrapper-linux-arm64.tar.gz` |
+| macOS x86-64 | `dd-test-wrapper-darwin-amd64.tar.gz` |
+| macOS ARM64 | `dd-test-wrapper-darwin-arm64.tar.gz` |
+
+Each archive contains the `dd-test-wrapper` binary and its licenses. The Linux binaries are statically linked, so they run on any distribution. `SHA256SUMS` lists the checksums of the archives.
+
+For example, with `curl` on Linux x86-64:
 
 ```bash
 mkdir -p bin
-curl -fsSL https://github.com/DataDog/dd-test-rs/releases/latest/download/dd-test-wrapper-linux-amd64 -o bin/dd-test-wrapper
-chmod +x bin/dd-test-wrapper
+curl -fsSL https://github.com/DataDog/dd-test-rs/releases/latest/download/dd-test-wrapper-linux-amd64.tar.gz | tar -xz -C bin dd-test-wrapper
 ```
 
 In GitHub Actions, you can download it with the `gh` command line tool instead. See [GitHub Actions](#github-actions).
@@ -79,9 +89,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Download dd-test-wrapper
         run: |
-          gh release download --repo DataDog/dd-test-rs --pattern "dd-test-wrapper-linux-amd64" --dir bin
-          mv bin/dd-test-wrapper-linux-amd64 bin/dd-test-wrapper
-          chmod +x bin/dd-test-wrapper
+          mkdir -p bin
+          gh release download --repo DataDog/dd-test-rs --pattern dd-test-wrapper-linux-amd64.tar.gz --output - | tar -xz -C bin dd-test-wrapper
           echo "$PWD/bin" >> "$GITHUB_PATH"
         env:
           GH_TOKEN: ${{ github.token }}
