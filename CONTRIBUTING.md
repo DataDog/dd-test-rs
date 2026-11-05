@@ -94,4 +94,15 @@ cargo install dd-rust-license-tool --version 1.0.6 --locked
 dd-rust-license-tool write
 ```
 
-Dependencies must use a license allowed in [`deny.toml`](deny.toml).
+Dependencies must use a license allowed in [`deny.toml`](deny.toml). The release archives include the license texts of the crates, generated from [`about.hbs`](about.hbs). When you allow a new license, add it to [`about.toml`](about.toml) too.
+
+## Releasing
+
+Maintainers release from `main` with the [Release workflow](.github/workflows/release.yml). It requires Maintain or Admin access to the repository.
+
+1. Open a pull request that sets the new version in the `[workspace.package]` section of [`Cargo.toml`](Cargo.toml) and in the `version` of the `dd-test-core` and `dd-test-agent` dependencies, then runs `cargo update --workspace` to update `Cargo.lock`. Merge it.
+2. Run the Release workflow on `main`, with the version as input, such as `v0.2.0`. It must match the version in `Cargo.toml`.
+3. The workflow builds and tests an archive for each platform, tags the commit, and creates a draft release with generated notes and the archives.
+4. Review the draft release, then publish it.
+
+Pull requests that change the release workflow, its scripts, or the license template also build and package the archives, without releasing.

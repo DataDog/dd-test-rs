@@ -1,0 +1,12 @@
+# Policy for the authorize and release jobs in .github/workflows/release.yml in DataDog/dd-test-rs
+issuer: https://token.actions.githubusercontent.com
+subject: repo:DataDog/dd-test-rs:ref:refs/heads/main
+
+claim_pattern:
+  event_name: workflow_dispatch
+  job_workflow_ref: DataDog/dd-test-rs/\.github/workflows/release\.yml@refs/heads/main
+  ref: refs/heads/main
+  repository: DataDog/dd-test-rs
+
+permissions:
+  contents: write
