@@ -37,12 +37,14 @@ In GitHub Actions, you can download it with the `gh` command line tool instead. 
 
 ## Setup
 
-Set three environment variables, then run your tests as usual:
+Set these environment variables, then run your tests as usual:
 
 ```bash
 export RUSTC_WORKSPACE_WRAPPER=dd-test-wrapper
 export DD_API_KEY=<your API key>
 export DD_SITE=datadoghq.com  # your Datadog site
+export DD_SERVICE=my-crate    # defaults to the repository name
+export DD_ENV=ci
 
 cargo test
 ```
@@ -51,12 +53,15 @@ cargo test
 
 `RUSTC_WORKSPACE_WRAPPER` accepts the name of a binary on your `PATH` or a full path. Use the [Datadog site](https://docs.datadoghq.com/getting_started/site/) of your organization for `DD_SITE`, such as `datadoghq.eu` or `us5.datadoghq.com`.
 
-Set `DD_SERVICE` and `DD_ENV` to find your tests more easily in Datadog:
+Test output, filters, and exit codes stay the same. When a feature changes the outcome of a test, such as a failed test that passes on retry, the test binary prints a summary line at the end:
 
-```bash
-export DD_SERVICE=my-crate
-export DD_ENV=ci
+```text
+Datadog Test Optimization: 2 retried executions, 1 quarantined failures ignored
 ```
+
+If Datadog cannot be reached, or `DD_API_KEY` is not set, tests run normally and a warning is printed.
+
+The first build with the wrapper recompiles your workspace crates, because Cargo includes the wrapper in its build fingerprint. Dependencies stay cached.
 
 ### GitHub Actions
 
@@ -84,38 +89,6 @@ jobs:
 ```
 
 The same variables work in any CI provider. CI and git metadata are detected automatically for AppVeyor, AWS CodePipeline, Azure Pipelines, Bitbucket Pipelines, Bitrise, Buddy, Buildkite, CircleCI, Codefresh, Drone, GitHub Actions, GitLab CI, Jenkins, TeamCity, and Travis CI.
-
-## Effect on test runs
-
-Test output, filters, and exit codes stay the same. The outcome of a test only changes when a feature requires it:
-
-- A test that fails and then passes on retry is reported to `cargo test` as passed.
-- A quarantined test still runs, but its failure does not fail `cargo test`.
-- A disabled test is skipped.
-- An attempt-to-fix test runs several times, and fails if any execution fails.
-
-When this happens, the test binary prints one summary line at the end, for example:
-
-```text
-Datadog Test Optimization: 2 retried executions, 1 quarantined failures ignored
-```
-
-If Datadog cannot be reached, or `DD_API_KEY` is not set, tests run normally and a warning is printed.
-
-The first build with the wrapper recompiles your workspace crates, because Cargo includes the wrapper in its build fingerprint. Dependencies stay cached.
-
-## How tests are reported
-
-| Datadog | Rust | Example |
-| --- | --- | --- |
-| Test session | one test binary | |
-| Test module | Cargo package | `bytes` |
-| Test suite | crate name and module path | `bytes::bytes_mut::tests` |
-| Test | function name | `test_original_capacity_to_repr` |
-
-Tests marked `#[ignore]` are reported as skipped, with their reason when you give one.
-
-When you filter tests, such as with `cargo test my_test`, test binaries without a matching test are not reported.
 
 ## Configuration
 
@@ -172,10 +145,20 @@ Git metadata comes from your CI provider and from the local checkout. Use these 
 | `DD_TEST_AGENT` | the installed wrapper | Path of the `dd-test-wrapper` binary that test binaries start. Set it when you run test binaries on another machine, or after moving the wrapper. |
 | `DD_TEST_READ_CACHE_DIR` | your user cache directory | Where test binaries of the same run share Datadog responses and git metadata. |
 
-## Compatibility
+## What is supported
 
+Each test binary is reported as a test session:
+
+| Datadog | Rust | Example |
+| --- | --- | --- |
+| Test session | one test binary | |
+| Test module | Cargo package | `bytes` |
+| Test suite | crate name and module path | `bytes::bytes_mut::tests` |
+| Test | function name | `test_original_capacity_to_repr` |
+
+- Tests marked `#[ignore]` are reported as skipped, with their reason when you give one.
+- When you filter tests, such as with `cargo test my_test`, test binaries without a matching test are not reported.
 - The wrapper works together with `RUSTC_WRAPPER` tools such as sccache. sccache still caches your dependencies, but not your workspace crates.
-- Each test binary is reported as its own test session.
 - Retries run in the same process, right after the failed execution. A retried test shares process state, such as statics, with its earlier executions.
 
 ### cargo nextest
@@ -188,7 +171,7 @@ nextest runs each test in its own process, and each process is reported like a t
 
 Use `cargo test` to report one test session per test binary.
 
-## Limitations
+### Limitations
 
 - Test Impact Analysis and code coverage are not supported yet.
 - Only Cargo is supported. Bazel is not.
