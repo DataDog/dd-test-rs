@@ -78,7 +78,7 @@ cargo test --workspace --locked
 
 ### License headers
 
-Every Rust file starts with this header:
+Every Rust file starts with this header, and shell scripts with the same lines as `#` comments:
 
 ```rust
 // Copyright 2026-Present Datadog, Inc. https://www.datadoghq.com/

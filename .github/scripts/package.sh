@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026-Present Datadog, Inc. https://www.datadoghq.com/
+# SPDX-License-Identifier: Apache-2.0
+
 # Usage: package.sh <target> <asset> <dist-dir>
 # Packages target/<target>/release/dd-test-wrapper as <dist-dir>/<asset>.tar.gz,
 # with the README, the licenses, and the license texts of the crates it includes.
