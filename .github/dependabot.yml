@@ -4,7 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 2
     groups:
+      # libdatadog crates depend on each other's versions, so they are updated together.
+      libdatadog:
+        patterns: ["libdd-*"]
       cargo:
         update-types: [minor, patch]
     commit-message:
@@ -14,6 +19,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 2
     groups:
       github-actions:
         patterns: ["*"]
