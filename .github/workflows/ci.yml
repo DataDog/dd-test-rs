@@ -59,7 +59,7 @@ jobs:
           persist-credentials: false
       - name: Check license headers
         run: |
-          missing=$(git ls-files '*.rs' | xargs grep -L '^// SPDX-License-Identifier: Apache-2.0$' || true)
+          missing=$( (git ls-files '*.rs' | xargs grep -L '^// SPDX-License-Identifier: Apache-2.0$'; git ls-files '*.sh' | xargs grep -L '^# SPDX-License-Identifier: Apache-2.0$') || true)
           if [ -n "$missing" ]; then
             echo "Files without a license header:"
             echo "$missing"

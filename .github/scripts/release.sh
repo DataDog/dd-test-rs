@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026-Present Datadog, Inc. https://www.datadoghq.com/
+# SPDX-License-Identifier: Apache-2.0
+
 # Usage: release.sh validate|create
 # validate checks that VERSION can be released from this workflow run.
 # create also tags the checked-out commit with VERSION and creates a draft
