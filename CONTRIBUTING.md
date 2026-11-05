@@ -24,6 +24,30 @@ To report a bug in dd-test-rs, [open a GitHub issue](https://github.com/DataDog/
 
 Do not report security vulnerabilities in public issues. See [SECURITY.md](SECURITY.md).
 
+## Development
+
+You need Rust 1.88 or later. To test the harness with other toolchains, such as 1.81 or nightly, install them with `rustup`.
+
+Build and test the workspace:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+```
+
+The end-to-end tests build [`fixtures/basic`](fixtures/basic) through the wrapper and check the results a fake Datadog intake receives. `DD_TEST_E2E_TOOLCHAIN` picks the toolchain that builds the fixture and the harness:
+
+```bash
+DD_TEST_E2E_TOOLCHAIN=1.81.0 cargo test -p dd-test-wrapper --test e2e
+```
+
+The harness is not a workspace member, so `cargo fmt` does not format it. Format it separately:
+
+```bash
+cargo fmt --all
+rustfmt --edition 2021 --config-path rustfmt.toml crates/dd-test-harness/src/lib.rs
+```
+
 ## Submitting a change
 
 1. Fork the repository and create a branch from `main`.
@@ -43,7 +67,7 @@ Keep pull requests focused on one change. Small pull requests are reviewed faste
 
 ### Checks
 
-The [Development](README.md#development) section of the README explains how to build and test the project. Before opening a pull request, run:
+Before opening a pull request, run:
 
 ```bash
 cargo fmt --all --check

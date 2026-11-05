@@ -1,30 +1,28 @@
 # Datadog Test Optimization for Rust
 
-Report your Rust tests to [Datadog Test Optimization](https://docs.datadoghq.com/tests/), and keep flaky tests from breaking your builds.
+Datadog's Rust library for instrumenting your tests. It reports tests that run with `cargo test` or `cargo nextest` to [Datadog Test Optimization](https://docs.datadoghq.com/tests/), without changes to your tests or your `Cargo.toml`.
 
-It works with your existing `cargo test` and `cargo nextest` commands. You do not change your tests or your `Cargo.toml`.
+The library ships as `dd-test-wrapper`, a `RUSTC_WORKSPACE_WRAPPER`. When Cargo compiles a test binary, the wrapper builds it with a test harness that reports every test to Datadog and applies the features enabled for your repository.
 
 ## Features
 
-- [Test Optimization](https://docs.datadoghq.com/tests/): collect results, durations, and errors for every test, with CI and git metadata.
-- [Flaky Test Management](https://docs.datadoghq.com/tests/flaky_management/): quarantine or disable flaky tests from Datadog, so known flakes do not fail your builds.
-- [Auto Test Retries](https://docs.datadoghq.com/tests/flaky_tests/auto_test_retries/): retry failed tests, so a flaky failure does not fail your build.
-- [Early Flake Detection](https://docs.datadoghq.com/tests/flaky_tests/early_flake_detection/): run new tests several times to catch flakiness before it reaches your default branch.
+- [Test Optimization](https://docs.datadoghq.com/tests/): results, durations, and errors of every test, with CI and git metadata.
+- [Flaky Test Management](https://docs.datadoghq.com/tests/flaky_management/): quarantine, disable, or attempt to fix flaky tests from Datadog.
+- [Auto Test Retries](https://docs.datadoghq.com/tests/flaky_tests/auto_test_retries/): retry failed tests, so a test that passes on retry does not fail your build.
+- [Early Flake Detection](https://docs.datadoghq.com/tests/flaky_tests/early_flake_detection/): run new tests several times to detect flakiness before they reach your default branch.
 
-You turn features on and off in Datadog, in the Test Optimization settings of your repository.
+Features are turned on and off in Datadog, in the Test Optimization settings of your repository.
 
 ## Requirements
 
 - Projects built with Cargo, using the standard test harness.
 - Rust 1.81 or later to build and run your tests.
 - Linux or macOS.
-- A Datadog [API key](https://docs.datadoghq.com/account_management/api-app-keys/). Results go directly to Datadog, so you do not need the Datadog Agent.
+- A Datadog [API key](https://docs.datadoghq.com/account_management/api-app-keys/). Results go directly to Datadog, so the Datadog Agent is not needed.
 
 ## Installation
 
-Prebuilt binaries for Linux and macOS will be attached to each [GitHub release](https://github.com/DataDog/dd-test-rs/releases), starting with the first release.
-
-Download one with `curl`:
+Prebuilt binaries for Linux and macOS are attached to each [GitHub release](https://github.com/DataDog/dd-test-rs/releases). For example, with `curl`:
 
 ```bash
 mkdir -p bin
@@ -50,7 +48,7 @@ cargo test
 
 `RUSTC_WORKSPACE_WRAPPER` accepts the name of a binary on your `PATH` or a full path. Use the [Datadog site](https://docs.datadoghq.com/getting_started/site/) of your organization for `DD_SITE`, such as `datadoghq.eu` or `us5.datadoghq.com`.
 
-We also recommend setting `DD_SERVICE` and `DD_ENV`, so you can find your tests in Datadog:
+Set `DD_SERVICE` and `DD_ENV` to find your tests more easily in Datadog:
 
 ```bash
 export DD_SERVICE=my-crate
@@ -84,9 +82,9 @@ jobs:
 
 The same variables work in any CI provider. CI and git metadata are detected automatically for AppVeyor, AWS CodePipeline, Azure Pipelines, Bitbucket Pipelines, Bitrise, Buddy, Buildkite, CircleCI, Codefresh, Drone, GitHub Actions, GitLab CI, Jenkins, TeamCity, and Travis CI.
 
-## What changes when you run your tests
+## Effect on test runs
 
-Your test output, filters, and exit codes stay the same. Datadog only changes the outcome of a test when a feature asks for it:
+Test output, filters, and exit codes stay the same. The outcome of a test only changes when a feature requires it:
 
 - A test that fails and then passes on retry is reported to `cargo test` as passed.
 - A quarantined test still runs, but its failure does not fail `cargo test`.
@@ -99,11 +97,11 @@ When this happens, the test binary prints one summary line at the end, for examp
 Datadog Test Optimization: 2 retried executions, 1 quarantined failures ignored
 ```
 
-If Datadog cannot be reached, or `DD_API_KEY` is not set, your tests run normally and a warning is printed.
+If Datadog cannot be reached, or `DD_API_KEY` is not set, tests run normally and a warning is printed.
 
-The first build with the wrapper recompiles your workspace crates, because Cargo includes the wrapper in its build fingerprint. Your dependencies stay cached.
+The first build with the wrapper recompiles your workspace crates, because Cargo includes the wrapper in its build fingerprint. Dependencies stay cached.
 
-## How tests appear in Datadog
+## How tests are reported
 
 | Datadog | Rust | Example |
 | --- | --- | --- |
@@ -206,44 +204,9 @@ If your tests do not appear in Datadog:
 2. Run with `DD_TRACE_DEBUG=true` to see what the library does, including requests to Datadog, how long they took, and their errors. Each debug line starts with the time and the process ID.
 3. Warnings starting with `[dd-test warn]` explain why results were not sent, for example `tests are not reported to Datadog: DD_API_KEY is not set`.
 
-## Development
-
-### Prerequisites
-
-- Rust 1.88 or later.
-- Optionally, other toolchains to test the harness with them, such as 1.81 or nightly.
-
-### Building
-
-```bash
-cargo build --workspace
-```
-
-### Testing
-
-```bash
-cargo test --workspace
-```
-
-The end-to-end tests build [`fixtures/basic`](fixtures/basic) through the wrapper and check the results a fake Datadog intake receives. `DD_TEST_E2E_TOOLCHAIN` picks the toolchain that builds the fixture and the harness:
-
-```bash
-DD_TEST_E2E_TOOLCHAIN=1.81.0 cargo test -p dd-test-wrapper --test e2e
-```
-
-### Formatting and linting
-
-```bash
-cargo fmt --all
-rustfmt --edition 2021 --config-path rustfmt.toml crates/dd-test-harness/src/lib.rs
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-The harness is not a workspace member, so `cargo fmt` does not format it.
-
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). To report a security vulnerability, see [SECURITY.md](SECURITY.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) to build and test the project, and to submit changes. To report a security vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
