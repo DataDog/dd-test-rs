@@ -243,7 +243,7 @@ impl ReadCache {
         }
     }
 
-    /// Removes files older than any TTL, within a small budget.
+    /// Removes cache files older than any TTL, within a small budget.
     fn cleanup(&self) {
         let started = Instant::now();
         let Ok(entries) = fs::read_dir(&self.dir) else {
@@ -252,6 +252,9 @@ impl ReadCache {
         for entry in entries.flatten().take(CLEANUP_MAX_ENTRIES) {
             if started.elapsed() > CLEANUP_MAX_DURATION {
                 break;
+            }
+            if !is_cache_file(&entry.file_name().to_string_lossy()) {
+                continue;
             }
             let old = entry
                 .metadata()
@@ -283,6 +286,20 @@ pub fn default_dir() -> PathBuf {
     base.unwrap_or_else(std::env::temp_dir)
         .join("dd-test-rs")
         .join("read-cache")
+}
+
+/// Matches the names the cache writes: `<key>.json`, `<key>.lock` and `<key>.tmp.<pid>.<nonce>`.
+fn is_cache_file(name: &str) -> bool {
+    let Some((key, suffix)) = name.split_once('.') else {
+        return false;
+    };
+    let hex = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let temp = |s: &str| {
+        s.strip_prefix("tmp.")
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(pid, nonce)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && hex(nonce))
+    };
+    key.len() == 64 && hex(key) && (suffix == "json" || suffix == "lock" || temp(suffix))
 }
 
 fn acquire(path: &Path) -> Acquire {
@@ -573,6 +590,37 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(cache.read(&cache.key("/p", &request("a"))).is_some());
         assert!(!lock_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recognizes_its_own_files() {
+        let key = "a".repeat(64);
+        for name in [format!("{key}.json"), format!("{key}.lock"), format!("{key}.tmp.42.1f")] {
+            assert!(is_cache_file(&name), "{name}");
+        }
+        for name in [
+            "keep-me.txt".to_string(),
+            "notes.json".to_string(),
+            format!("{key}.txt"),
+            format!("{key}.tmp.42"),
+            format!("{key}.tmp.x.1f"),
+            format!("{}.json", "g".repeat(64)),
+        ] {
+            assert!(!is_cache_file(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_old_files_it_did_not_create() {
+        let dir = temp_dir("cleanup");
+        create_dir(&dir).unwrap();
+        let old = std::time::SystemTime::now() - STALE_AFTER * 2;
+        for name in ["keep-me.txt", "notes.json"] {
+            File::create(dir.join(name)).unwrap().set_modified(old).unwrap();
+        }
+        cache(&dir).cleanup();
+        assert!(dir.join("keep-me.txt").exists() && dir.join("notes.json").exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
