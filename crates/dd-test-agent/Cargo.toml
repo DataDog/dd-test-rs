@@ -19,7 +19,7 @@ serde_json = "1"
 tokio = { version = "1.49", features = ["rt", "rt-multi-thread", "time"] }
 libdd-capabilities-impl = "6"
 libdd-common = { version = "7", default-features = false }
-libdd-telemetry = { version = "9", default-features = false }
+libdd-telemetry = { version = "12", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
