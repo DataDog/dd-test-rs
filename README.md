@@ -17,30 +17,14 @@ You turn features on and off in Datadog, in the Test Optimization settings of yo
 
 - Projects built with Cargo, using the standard test harness.
 - Rust 1.81 or later to build and run your tests.
-- Rust 1.88 or later to install the wrapper with Cargo or build it from source. You can use a different toolchain than the one your project uses. Prebuilt binaries have no toolchain requirement.
 - Linux or macOS.
 - A Datadog [API key](https://docs.datadoghq.com/account_management/api-app-keys/). Results go directly to Datadog, so you do not need the Datadog Agent.
 
 ## Installation
 
-### Download a prebuilt binary
-
 Prebuilt binaries for Linux and macOS will be attached to each [GitHub release](https://github.com/DataDog/dd-test-rs/releases), starting with the first release.
 
-In GitHub Actions, download one with the `gh` command line tool:
-
-```yaml
-- name: Download dd-test-wrapper
-  run: |
-    gh release download --repo DataDog/dd-test-rs --pattern "dd-test-wrapper-linux-amd64" --dir bin
-    mv bin/dd-test-wrapper-linux-amd64 bin/dd-test-wrapper
-    chmod +x bin/dd-test-wrapper
-    echo "$PWD/bin" >> "$GITHUB_PATH"
-  env:
-    GH_TOKEN: ${{ github.token }}
-```
-
-Or with `curl`:
+Download one with `curl`:
 
 ```bash
 mkdir -p bin
@@ -48,26 +32,7 @@ curl -fsSL https://github.com/DataDog/dd-test-rs/releases/latest/download/dd-tes
 chmod +x bin/dd-test-wrapper
 ```
 
-### Install with Cargo
-
-```bash
-cargo install --locked --git https://github.com/DataDog/dd-test-rs dd-test-wrapper
-```
-
-Once the crate is published on crates.io, you will also be able to run:
-
-```bash
-cargo install --locked dd-test-wrapper
-```
-
-### Build from source
-
-```bash
-git clone https://github.com/DataDog/dd-test-rs.git
-cd dd-test-rs && cargo build --release -p dd-test-wrapper
-```
-
-This creates `target/release/dd-test-wrapper`. It requires Rust 1.88 or later.
+In GitHub Actions, you can download it with the `gh` command line tool instead. See [GitHub Actions](#github-actions).
 
 ## Setup
 
@@ -106,7 +71,14 @@ jobs:
       DD_ENV: ci
     steps:
       - uses: actions/checkout@v4
-      - run: cargo install --locked --git https://github.com/DataDog/dd-test-rs dd-test-wrapper
+      - name: Download dd-test-wrapper
+        run: |
+          gh release download --repo DataDog/dd-test-rs --pattern "dd-test-wrapper-linux-amd64" --dir bin
+          mv bin/dd-test-wrapper-linux-amd64 bin/dd-test-wrapper
+          chmod +x bin/dd-test-wrapper
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - run: cargo test
 ```
 
