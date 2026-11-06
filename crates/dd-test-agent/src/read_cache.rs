@@ -28,8 +28,6 @@ const MAX_BACKOFF: Duration = Duration::from_millis(20);
 const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Also the longest TTL, so older files are never fresh.
 const STALE_AFTER: Duration = Duration::from_secs(3600);
-/// Far longer than a takeover takes, so an older guard belongs to a dead agent.
-const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CLEANUP_MAX_ENTRIES: usize = 32;
 const CLEANUP_MAX_DURATION: Duration = Duration::from_millis(5);
 
@@ -333,29 +331,44 @@ fn acquire(path: &Path, waiting: bool) -> Acquire {
     }
 }
 
-/// Replaces a stale lock in place while holding a takeover guard, so only one
-/// agent replaces it and the lock never disappears for the waiters.
+/// Replaces a stale lock in place while holding the takeover guard, an OS
+/// lock on `<key>.takeover`, so only one agent replaces it and the lock never
+/// disappears for the waiters. The OS releases the guard when its holder dies.
 fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
-    let guard = path.with_extension("takeover");
-    if write_new(&guard, &[]).is_err() {
-        let abandoned = fs::metadata(&guard)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > TAKEOVER_TIMEOUT);
-        if abandoned {
-            let _ = fs::remove_file(&guard);
-        }
+    let Some(_guard) = takeover_guard(&path.with_extension("takeover")) else {
+        return Acquire::Held;
+    };
+    if fs::read(path).ok().as_deref() != Some(stale) {
         return Acquire::Held;
     }
-    let result = if fs::read(path).ok().as_deref() == Some(stale) {
-        debug!("read_cache: owner gone, taking over [lock:{}]", path.display());
-        replace(path, &lock).map_or(Acquire::Bypass, |()| Acquire::Owner(lock))
-    } else {
-        Acquire::Held
-    };
-    let _ = fs::remove_file(&guard);
-    result
+    debug!("read_cache: owner gone, taking over [lock:{}]", path.display());
+    replace(path, &lock).map_or(Acquire::Bypass, |()| Acquire::Owner(lock))
+}
+
+/// The open guard file, locked until it is dropped. Its modification time is
+/// refreshed so that cleanup leaves it alone.
+#[cfg(unix)]
+fn takeover_guard(path: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .ok()?;
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+    if !locked {
+        return None;
+    }
+    let _ = file.set_modified(std::time::SystemTime::now());
+    Some(file)
+}
+
+#[cfg(not(unix))]
+fn takeover_guard(_path: &Path) -> Option<File> {
+    None
 }
 
 fn replace(path: &Path, lock: &Lock) -> std::io::Result<()> {
@@ -695,6 +708,19 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Retries `f` for a while. Child processes that other tests start share
+    /// open files until they exec, so they can briefly hold a released guard.
+    fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(value) = f() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn only_one_agent_takes_over_a_stale_lock() {
         let dir = temp_dir("takeover");
@@ -713,12 +739,19 @@ mod tests {
         assert!(matches!(take_over(&path, &stale, second), Acquire::Held));
         let current: Lock = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert!(current == first);
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let mut files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["k.lock", "k.takeover"]);
 
         fs::write(&path, &stale).unwrap();
-        File::create(path.with_extension("takeover")).unwrap();
+        let held = eventually(|| takeover_guard(&path.with_extension("takeover")));
         assert!(matches!(acquire(&path, false), Acquire::Held));
         assert_eq!(fs::read(&path).unwrap(), stale);
+        drop(held);
+        eventually(|| matches!(acquire(&path, false), Acquire::Owner(_)).then_some(()));
         let _ = fs::remove_dir_all(&dir);
     }
 
