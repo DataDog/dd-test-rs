@@ -596,7 +596,7 @@ mod tests {
         let releaser = {
             let lock_path = lock_path.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(300));
                 release(&lock_path, &owner);
             })
         };
