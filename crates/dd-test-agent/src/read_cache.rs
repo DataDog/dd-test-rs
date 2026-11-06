@@ -145,8 +145,9 @@ impl ReadCache {
         let lock_path = self.dir.join(format!("{key}.lock"));
         let started = Instant::now();
         let mut backoff = INITIAL_BACKOFF;
+        let mut waiting = false;
         loop {
-            match acquire(&lock_path) {
+            match acquire(&lock_path, waiting) {
                 Acquire::Owner(lock) => {
                     let result = match self.read(&key) {
                         Some(hit) => {
@@ -173,7 +174,7 @@ impl ReadCache {
                     debug!("read_cache: lock bypass [endpoint:{endpoint} key:{key}]");
                     return live();
                 }
-                Acquire::Held => {}
+                Acquire::Held => waiting = true,
             }
             if started.elapsed() >= WAIT_TIMEOUT {
                 debug!(
@@ -311,16 +312,20 @@ fn is_cache_file(name: &str) -> bool {
     key.len() == 64 && hex(key) && (matches!(suffix, "json" | "lock" | "takeover") || temp(suffix))
 }
 
-fn acquire(path: &Path) -> Acquire {
+/// Takes the lock, or takes over a stale one. A waiter only takes over stale
+/// locks: when the owner releases the lock, waiters request for themselves.
+fn acquire(path: &Path, waiting: bool) -> Acquire {
     let lock = Lock {
         pid: std::process::id(),
         created_at: now_nanos(),
         nonce: new_id(),
     };
-    match try_lock(path, &lock) {
-        Ok(true) => return Acquire::Owner(lock),
-        Ok(false) => {}
-        Err(_) => return Acquire::Bypass,
+    if !waiting {
+        match try_lock(path, &lock) {
+            Ok(true) => return Acquire::Owner(lock),
+            Ok(false) => {}
+            Err(_) => return Acquire::Bypass,
+        }
     }
     match fs::read(path) {
         Ok(current) if is_stale(&current) => take_over(path, &current, lock),
@@ -697,7 +702,7 @@ mod tests {
         let path = dir.join("k.lock");
         let stale = b"stale".to_vec();
         fs::write(&path, &stale).unwrap();
-        let Acquire::Owner(first) = acquire(&path) else {
+        let Acquire::Owner(first) = acquire(&path, false) else {
             panic!("the first agent takes over");
         };
         let second = Lock {
@@ -712,7 +717,7 @@ mod tests {
 
         fs::write(&path, &stale).unwrap();
         File::create(path.with_extension("takeover")).unwrap();
-        assert!(matches!(acquire(&path), Acquire::Held));
+        assert!(matches!(acquire(&path, false), Acquire::Held));
         assert_eq!(fs::read(&path).unwrap(), stale);
         let _ = fs::remove_dir_all(&dir);
     }
