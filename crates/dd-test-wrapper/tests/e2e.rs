@@ -243,6 +243,26 @@ fn binaries_without_matching_tests_are_not_reported() {
 }
 
 #[test]
+fn names_resources_like_other_libraries() {
+    let run = run_fixture(
+        &["test", "--quiet", "--test", "integration", "--", "--exact", "adds"],
+        &[],
+    );
+    assert!(run.output.status.success());
+    let recorded = run.recorded.lock().unwrap();
+    let resources = |kind| -> Vec<&str> {
+        events_of(&recorded.events, kind)
+            .iter()
+            .map(|e| e.pointer("/content/resource").and_then(Value::as_str).unwrap_or(""))
+            .collect()
+    };
+    assert_eq!(resources("test"), ["integration.adds"]);
+    assert_eq!(resources("test_suite_end"), ["libtest.test_suite.integration"]);
+    assert_eq!(resources("test_module_end"), ["libtest.test_module.basic-fixture"]);
+    assert!(resources("test_session_end")[0].starts_with("libtest.test_session.cargo test"));
+}
+
+#[test]
 fn adds_dd_tags_to_events_and_custom_configurations_to_requests() {
     let run = run_fixture(
         &["test", "--quiet", "--test", "integration"],
