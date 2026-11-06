@@ -245,17 +245,23 @@ impl ReadCache {
 
     /// Removes cache files older than any TTL, within a small budget.
     fn cleanup(&self) {
+        self.cleanup_within(CLEANUP_MAX_DURATION);
+    }
+
+    fn cleanup_within(&self, max_duration: Duration) {
         let started = Instant::now();
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return;
         };
-        for entry in entries.flatten().take(CLEANUP_MAX_ENTRIES) {
-            if started.elapsed() > CLEANUP_MAX_DURATION {
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            if checked == CLEANUP_MAX_ENTRIES || started.elapsed() > max_duration {
                 break;
             }
             if !is_cache_file(&entry.file_name().to_string_lossy()) {
                 continue;
             }
+            checked += 1;
             let old = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -619,8 +625,14 @@ mod tests {
         for name in ["keep-me.txt", "notes.json"] {
             File::create(dir.join(name)).unwrap().set_modified(old).unwrap();
         }
-        cache(&dir).cleanup();
+        let expired = dir.join(format!("{}.json", "a".repeat(64)));
+        File::create(&expired).unwrap().set_modified(old).unwrap();
+        for i in 0..=CLEANUP_MAX_ENTRIES {
+            File::create(dir.join(format!("other-{i}.txt"))).unwrap();
+        }
+        cache(&dir).cleanup_within(Duration::MAX);
         assert!(dir.join("keep-me.txt").exists() && dir.join("notes.json").exists());
+        assert!(!expired.exists(), "other files do not use up the cleanup budget");
         let _ = fs::remove_dir_all(&dir);
     }
 
