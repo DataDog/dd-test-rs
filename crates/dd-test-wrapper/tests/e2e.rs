@@ -46,6 +46,7 @@ const CI_PROVIDER_VARS: &[&str] = &[
 #[derive(Default)]
 struct Recorded {
     upload_delay: Duration,
+    test_management: Option<&'static str>,
     paths: Vec<String>,
     settings_requests: Vec<Value>,
     events: Vec<Value>,
@@ -90,7 +91,9 @@ fn handle(stream: TcpStream, recorded: &Mutex<Recorded>) {
     let response = match path.as_str() {
         "/api/v2/libraries/tests/services/setting" => SETTINGS,
         "/api/v2/ci/libraries/tests" => KNOWN_TESTS,
-        "/api/v2/test/libraries/test-management/tests" => TEST_MANAGEMENT,
+        "/api/v2/test/libraries/test-management/tests" => {
+            recorded.lock().unwrap().test_management.unwrap_or(TEST_MANAGEMENT)
+        }
         _ => "{}",
     };
     {
@@ -153,12 +156,20 @@ fn run_fixture(args: &[&str], env: &[(&str, &str)]) -> Run {
 }
 
 fn run_fixture_with_upload_delay(args: &[&str], env: &[(&str, &str)], upload_delay: Duration) -> Run {
+    run_fixture_against(
+        Recorded {
+            upload_delay,
+            ..Recorded::default()
+        },
+        args,
+        env,
+    )
+}
+
+fn run_fixture_against(intake: Recorded, args: &[&str], env: &[(&str, &str)]) -> Run {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let recorded = Arc::new(Mutex::new(Recorded {
-        upload_delay,
-        ..Recorded::default()
-    }));
+    let recorded = Arc::new(Mutex::new(intake));
     let server_state = Arc::clone(&recorded);
     std::thread::spawn(move || serve(listener, server_state));
 
@@ -228,6 +239,23 @@ fn binaries_built_with_reporting_off_report_when_it_is_on() {
     );
     let recorded = on.recorded.lock().unwrap();
     assert_eq!(events_of(&recorded.events, "test_session_end").len(), 1);
+}
+
+#[test]
+fn an_empty_test_management_response_disables_test_management() {
+    let run = run_fixture_against(
+        Recorded {
+            test_management: Some(r#"{"data":{"attributes":{"modules":{}}}}"#),
+            ..Recorded::default()
+        },
+        &["test", "--quiet", "--test", "integration", "--", "--exact", "adds"],
+        &[],
+    );
+    assert!(run.output.status.success());
+    let recorded = run.recorded.lock().unwrap();
+    let sessions = events_of(&recorded.events, "test_session_end");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(meta(sessions[0], "test.test_management.enabled"), "");
 }
 
 #[test]
