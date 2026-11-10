@@ -12,11 +12,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const ATTEMPTS: u32 = 3;
 const MAX_ERROR_BODY_CHARS: usize = 200;
 
@@ -78,38 +80,85 @@ pub struct Transport {
     unreachable: Arc<Unreachable>,
 }
 
-/// The hosts that did not answer. Timeouts are shared through the read cache
-/// with the other agents of the run, so they do not wait for the same timeout.
+/// The hosts that did not answer. A timeout is shared through the read cache
+/// with the other agents of the run when a TCP connection to the host cannot be
+/// opened either, so they do not wait for the same timeout. A slow host is only
+/// skipped by the agent that waited for it.
 struct Unreachable {
     hosts: Mutex<HashSet<String>>,
+    answered: Mutex<HashSet<String>>,
+    warned: Mutex<HashSet<String>>,
     cache: Option<ReadCache>,
+    connects: fn(&str) -> bool,
 }
 
 impl Unreachable {
     fn contains(&self, host: &str) -> bool {
-        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        if hosts.contains(host) {
+        if lock(&self.hosts).contains(host) {
             return true;
         }
         let shared = self.cache.as_ref().is_some_and(|cache| cache.is_unreachable(host));
-        if shared {
+        if shared && lock(&self.warned).insert(host.to_string()) {
             warn!("{host} did not answer another test binary of this run, no requests are sent to it");
-            hosts.insert(host.to_string());
         }
         shared
     }
 
     fn mark(&self, host: &str, error: &HttpClientError, url: &str) {
-        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
-        if hosts.insert(host.to_string()) {
-            warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
-            if matches!(error, HttpClientError::TimedOut) {
-                if let Some(cache) = &self.cache {
-                    cache.mark_unreachable(host);
-                }
+        if !lock(&self.hosts).insert(host.to_string()) {
+            return;
+        }
+        warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
+        if let (HttpClientError::TimedOut, Some(cache)) = (error, &self.cache) {
+            if !(self.connects)(host) {
+                cache.mark_unreachable(host);
             }
         }
     }
+
+    /// A warm-up request that times out after the host answered a real
+    /// request does not mark it.
+    fn warm_up_timed_out(&self, host: &str, url: &str) {
+        if !lock(&self.answered).contains(host) {
+            self.mark(host, &HttpClientError::TimedOut, url);
+        }
+    }
+
+    fn answered(&self, host: &str) {
+        lock(&self.answered).insert(host.to_string());
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether a TCP connection to `host`, a URL scheme and authority, opens
+/// within `PROBE_TIMEOUT`.
+fn tcp_connects(host: &str) -> bool {
+    let (scheme, authority) = host.split_once("://").unwrap_or(("https", host));
+    let has_port = !authority.ends_with(']')
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    let address = if has_port {
+        authority.to_string()
+    } else {
+        format!("{authority}:{}", if scheme == "http" { 80 } else { 443 })
+    };
+    let Ok(addresses) = address.to_socket_addrs() else {
+        return false;
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    for address in addresses {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        if TcpStream::connect_timeout(&address, remaining).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 impl Transport {
@@ -141,7 +190,10 @@ impl Transport {
             timeout: TIMEOUT,
             unreachable: Arc::new(Unreachable {
                 hosts: Mutex::new(HashSet::new()),
+                answered: Mutex::new(HashSet::new()),
+                warned: Mutex::new(HashSet::new()),
                 cache,
+                connects: tcp_connects,
             }),
         })
     }
@@ -169,7 +221,7 @@ impl Transport {
 
     /// Opens the connection to the host serving `intake` in the background, so
     /// the first request to it does not wait for TCP and TLS setup. A timeout
-    /// marks the host unreachable.
+    /// marks the host unreachable unless it answered a request meanwhile.
     pub fn warm_up(&self, intake: Intake) {
         let host = self.host(intake);
         if self.is_host_unreachable(&host) {
@@ -183,10 +235,11 @@ impl Transport {
             .with_timeout(self.timeout);
         self.runtime.spawn(async move {
             let started = Instant::now();
-            if let Err(error @ HttpClientError::TimedOut) = client.send(request).await {
-                unreachable.mark(&host, &error, &url);
-            }
+            let result = client.send(request).await;
             debug!("opened the connection to {url} in {:?}", started.elapsed());
+            if let Err(HttpClientError::TimedOut) = result {
+                let _ = tokio::task::spawn_blocking(move || unreachable.warm_up_timed_out(&host, &url)).await;
+            }
         });
     }
 
@@ -233,10 +286,12 @@ impl Transport {
             let elapsed = started.elapsed();
             let retry = match result {
                 Ok(response) => {
+                    self.unreachable.answered(&host);
                     debug!("POST {url}: {} bytes in {elapsed:?}", response.body().len());
                     return Ok(response.body().to_vec());
                 }
                 Err(HttpClientError::RequestFailed { status, body }) => {
+                    self.unreachable.answered(&host);
                     last_error = RequestError {
                         status: Some(status),
                         message: format!("{url} returned {status}: {}", printable_body(&body)),
@@ -466,6 +521,10 @@ mod tests {
     }
 
     fn shared(url: &str, dir: &std::path::Path) -> Transport {
+        shared_with_probe(url, dir, |_| false)
+    }
+
+    fn shared_with_probe(url: &str, dir: &std::path::Path, connects: fn(&str) -> bool) -> Transport {
         let config = Config::from_lookup(|key| match key {
             "DD_API_KEY" => Some("k".into()),
             "DD_CIVISIBILITY_AGENTLESS_URL" => Some(url.to_string()),
@@ -475,6 +534,7 @@ mod tests {
         let cache = ReadCache::new(dir.to_path_buf(), &scope, &config, "0");
         let mut transport = Transport::new(&config, Some(cache)).unwrap();
         transport.timeout = Duration::from_millis(200);
+        Arc::get_mut(&mut transport.unreachable).unwrap().connects = connects;
         transport
     }
 
@@ -514,13 +574,54 @@ mod tests {
         let dir = cache_dir("warm-up");
         let transport = shared(&url, &dir);
         transport.warm_up(Intake::TestCycle);
+        let other = shared(&url, &dir);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !transport.is_unreachable(Intake::TestCycle) {
+        while !other.is_unreachable(Intake::TestCycle) {
             assert!(Instant::now() < deadline, "the warm-up times out");
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        assert!(transport.is_unreachable(Intake::TestCycle));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slow_responses_are_not_shared() {
+        let (url, _) = server(None);
+        let dir = cache_dir("slow");
+        let first = shared_with_probe(&url, &dir, tcp_connects);
+        assert!(post(&first).is_err());
+        assert!(first.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markers_from_other_agents_expire() {
+        let (url, _) = server(None);
+        let dir = cache_dir("expire");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let other = shared(&url, &dir);
+        assert!(other.is_unreachable(Intake::TestCycle));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!other.is_unreachable(Intake::TestCycle));
+    }
+
+    #[test]
+    fn a_warm_up_timeout_after_an_answer_is_ignored() {
+        let (url, _) = server(None);
+        let dir = cache_dir("answered");
+        let transport = shared(&url, &dir);
+        transport.unreachable.answered(&url);
+        transport.unreachable.warm_up_timed_out(&url, &url);
+        assert!(!transport.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probes_tcp_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(tcp_connects(&format!("http://{}", listener.local_addr().unwrap())));
+        assert!(!tcp_connects("https://unresolvable.invalid"));
     }
 
     #[test]
