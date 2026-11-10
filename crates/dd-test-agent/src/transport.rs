@@ -138,8 +138,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Whether a TCP connection to `host`, a base URL, opens within
 /// `PROBE_TIMEOUT`, name resolution included. Every address is tried at once.
+/// Requests through a proxy take another route, so the host is then assumed to
+/// accept connections.
 fn tcp_connects(host: &str) -> bool {
     let (scheme, rest) = host.split_once("://").unwrap_or(("https", host));
+    if uses_proxy(scheme, |name| std::env::var_os(name)) {
+        return true;
+    }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
     let has_port = !authority.ends_with(']')
@@ -172,6 +177,16 @@ fn tcp_connects(host: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether the proxy variables the HTTP client reads are set for `scheme`.
+fn uses_proxy(scheme: &str, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let names: &[&str] = if scheme == "http" {
+        &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+    } else {
+        &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+    };
+    names.iter().any(|name| var(name).is_some_and(|v| !v.is_empty()))
 }
 
 impl Transport {
@@ -631,12 +646,28 @@ mod tests {
     }
 
     #[test]
+    fn detects_proxies_for_the_scheme() {
+        let set = |names: &'static [&'static str]| {
+            move |name: &str| {
+                names
+                    .contains(&name)
+                    .then(|| std::ffi::OsString::from("http://proxy:3128"))
+            }
+        };
+        assert!(uses_proxy("https", set(&["HTTPS_PROXY"])));
+        assert!(uses_proxy("https", set(&["all_proxy"])));
+        assert!(!uses_proxy("https", set(&["HTTP_PROXY"])));
+        assert!(uses_proxy("http", set(&["http_proxy"])));
+        assert!(!uses_proxy("http", set(&[])));
+    }
+
+    #[test]
     fn probes_tcp_connections() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         assert!(tcp_connects(&format!("http://{address}")));
         assert!(tcp_connects(&format!("http://user@{address}/proxy?x=1")));
-        assert!(!tcp_connects("https://unresolvable.invalid"));
+        assert!(!tcp_connects("http://unresolvable.invalid"));
     }
 
     #[test]
