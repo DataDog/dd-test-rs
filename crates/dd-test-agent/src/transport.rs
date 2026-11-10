@@ -104,8 +104,11 @@ impl Unreachable {
         shared
     }
 
+    /// Holds the lock until the marker is shared, so concurrent requests to
+    /// the host wait for the probe instead of releasing cache waiters early.
     fn mark(&self, host: &str, error: &HttpClientError, url: &str) {
-        if !lock(&self.hosts).insert(host.to_string()) {
+        let mut hosts = lock(&self.hosts);
+        if !hosts.insert(host.to_string()) {
             return;
         }
         warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
@@ -133,10 +136,12 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether a TCP connection to `host`, a URL scheme and authority, opens
-/// within `PROBE_TIMEOUT`.
+/// Whether a TCP connection to `host`, a base URL, opens within
+/// `PROBE_TIMEOUT`, name resolution included. Every address is tried at once.
 fn tcp_connects(host: &str) -> bool {
-    let (scheme, authority) = host.split_once("://").unwrap_or(("https", host));
+    let (scheme, rest) = host.split_once("://").unwrap_or(("https", host));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
     let has_port = !authority.ends_with(']')
         && authority
             .rsplit_once(':')
@@ -146,16 +151,24 @@ fn tcp_connects(host: &str) -> bool {
     } else {
         format!("{authority}:{}", if scheme == "http" { 80 } else { 443 })
     };
-    let Ok(addresses) = address.to_socket_addrs() else {
-        return false;
-    };
     let deadline = Instant::now() + PROBE_TIMEOUT;
-    for address in addresses {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        if TcpStream::connect_timeout(&address, remaining).is_ok() {
-            return true;
+    let (sender, results) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for address in address.to_socket_addrs().into_iter().flatten() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(TcpStream::connect_timeout(&address, remaining).is_ok());
+            });
+        }
+    });
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match results.recv_timeout(remaining) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
         }
     }
     false
@@ -620,7 +633,9 @@ mod tests {
     #[test]
     fn probes_tcp_connections() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        assert!(tcp_connects(&format!("http://{}", listener.local_addr().unwrap())));
+        let address = listener.local_addr().unwrap();
+        assert!(tcp_connects(&format!("http://{address}")));
+        assert!(tcp_connects(&format!("http://user@{address}/proxy?x=1")));
         assert!(!tcp_connects("https://unresolvable.invalid"));
     }
 
