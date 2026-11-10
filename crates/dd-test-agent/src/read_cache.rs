@@ -336,8 +336,10 @@ fn acquire(path: &Path, waiting: bool) -> Acquire {
 /// lock on `<key>.takeover`, so only one agent replaces it and the lock never
 /// disappears for the waiters. The OS releases the guard when its holder dies.
 fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
-    let Some(_guard) = takeover_guard(&path.with_extension("takeover")) else {
-        return Acquire::Held;
+    let _guard = match takeover_guard(&path.with_extension("takeover")) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Acquire::Held,
+        Err(_) => return Acquire::Bypass,
     };
     if fs::read(path).ok().as_deref() != Some(stale) {
         return Acquire::Held;
@@ -346,9 +348,10 @@ fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
     replace(path, &lock).map_or(Acquire::Bypass, |()| Acquire::Owner(lock))
 }
 
-/// The open guard file, locked until it is dropped.
+/// The open guard file, locked until it is dropped, or `None` when another
+/// agent holds it.
 #[cfg(unix)]
-fn takeover_guard(path: &Path) -> Option<File> {
+fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new()
@@ -356,18 +359,21 @@ fn takeover_guard(path: &Path) -> Option<File> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)
-        .ok()?;
-    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
-    if !locked {
-        return None;
+        .open(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
     }
-    Some(file)
+    let error = std::io::Error::last_os_error();
+    if error.kind() == ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(not(unix))]
-fn takeover_guard(_path: &Path) -> Option<File> {
-    None
+fn takeover_guard(_path: &Path) -> std::io::Result<Option<File>> {
+    Err(ErrorKind::Unsupported.into())
 }
 
 fn replace(path: &Path, lock: &Lock) -> std::io::Result<()> {
@@ -744,11 +750,23 @@ mod tests {
         assert_eq!(files, ["k.lock", "k.takeover"]);
 
         fs::write(&path, &stale).unwrap();
-        let held = eventually(|| takeover_guard(&path.with_extension("takeover")));
+        let held = eventually(|| takeover_guard(&path.with_extension("takeover")).unwrap());
         assert!(matches!(acquire(&path, false), Acquire::Held));
         assert_eq!(fs::read(&path).unwrap(), stale);
         drop(held);
         eventually(|| matches!(acquire(&path, false), Acquire::Owner(_)).then_some(()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bypasses_a_stale_lock_whose_guard_cannot_be_opened() {
+        let dir = temp_dir("guard-error");
+        create_dir(&dir).unwrap();
+        let path = dir.join("k.lock");
+        fs::write(&path, b"stale").unwrap();
+        fs::create_dir(path.with_extension("takeover")).unwrap();
+        assert!(matches!(acquire(&path, false), Acquire::Bypass));
         let _ = fs::remove_dir_all(&dir);
     }
 
