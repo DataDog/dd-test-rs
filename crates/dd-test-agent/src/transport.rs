@@ -136,17 +136,31 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether a TCP connection to `host`, a base URL, opens within
-/// `PROBE_TIMEOUT`, name resolution included. Every address is tried at once.
-/// Requests through a proxy take another route, so the host is then assumed to
-/// accept connections.
+/// Whether `host`, a base URL, accepts TCP connections. Requests through a
+/// proxy take another route, so the host is then assumed to accept them.
 fn tcp_connects(host: &str) -> bool {
-    let (scheme, rest) = host.split_once("://").unwrap_or(("https", host));
-    if uses_proxy(scheme, |name| std::env::var_os(name)) {
-        return true;
-    }
+    let (scheme, authority) = split_url(host);
+    uses_proxy(scheme, hostname(authority), |name| std::env::var(name).ok()) || connects_directly(host)
+}
+
+/// The scheme and the `host[:port]` authority of a URL.
+fn split_url(url: &str) -> (&str, &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    (scheme, authority.rsplit_once('@').map_or(authority, |(_, host)| host))
+}
+
+fn hostname(authority: &str) -> &str {
+    match authority.strip_prefix('[') {
+        Some(ipv6) => ipv6.split(']').next().unwrap_or(ipv6),
+        None => authority.split(':').next().unwrap_or(authority),
+    }
+}
+
+/// Whether a direct TCP connection to `host`, a base URL, opens within
+/// `PROBE_TIMEOUT`, name resolution included. Every address is tried at once.
+fn connects_directly(host: &str) -> bool {
+    let (scheme, authority) = split_url(host);
     let has_port = !authority.ends_with(']')
         && authority
             .rsplit_once(':')
@@ -179,14 +193,27 @@ fn tcp_connects(host: &str) -> bool {
     false
 }
 
-/// Whether the proxy variables the HTTP client reads are set for `scheme`.
-fn uses_proxy(scheme: &str, var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    let names: &[&str] = if scheme == "http" {
-        &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+/// Whether the HTTP client sends requests to `hostname` through a proxy, from
+/// the proxy variables it reads. `NO_PROXY` entries match the host, its
+/// domain suffixes, or every host for `*`.
+fn uses_proxy(scheme: &str, hostname: &str, var: impl Fn(&str) -> Option<String>) -> bool {
+    let first = |names: &[&str]| names.iter().find_map(|name| var(name).filter(|v| !v.is_empty()));
+    let proxy = if scheme == "http" {
+        first(&["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"])
     } else {
-        &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        first(&["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"])
     };
-    names.iter().any(|name| var(name).is_some_and(|v| !v.is_empty()))
+    if proxy.is_none() {
+        return false;
+    }
+    let hostname = hostname.to_ascii_lowercase();
+    let bypassed = first(&["NO_PROXY", "no_proxy"]).is_some_and(|no_proxy| {
+        no_proxy.split(',').map(str::trim).any(|entry| {
+            let domain = entry.trim_start_matches('.').to_ascii_lowercase();
+            entry == "*" || (!domain.is_empty() && (hostname == domain || hostname.ends_with(&format!(".{domain}"))))
+        })
+    });
+    !bypassed
 }
 
 impl Transport {
@@ -645,29 +672,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+
     #[test]
     fn detects_proxies_for_the_scheme() {
-        let set = |names: &'static [&'static str]| {
-            move |name: &str| {
-                names
-                    .contains(&name)
-                    .then(|| std::ffi::OsString::from("http://proxy:3128"))
-            }
-        };
-        assert!(uses_proxy("https", set(&["HTTPS_PROXY"])));
-        assert!(uses_proxy("https", set(&["all_proxy"])));
-        assert!(!uses_proxy("https", set(&["HTTP_PROXY"])));
-        assert!(uses_proxy("http", set(&["http_proxy"])));
-        assert!(!uses_proxy("http", set(&[])));
+        let host = "api.datadoghq.com";
+        assert!(uses_proxy("https", host, env(&[("HTTPS_PROXY", "http://proxy")])));
+        assert!(uses_proxy("https", host, env(&[("all_proxy", "http://proxy")])));
+        assert!(!uses_proxy("https", host, env(&[("HTTP_PROXY", "http://proxy")])));
+        assert!(uses_proxy("http", host, env(&[("http_proxy", "http://proxy")])));
+        assert!(!uses_proxy("http", host, env(&[])));
+        for no_proxy in ["*", "api.datadoghq.com", ".datadoghq.com", "localhost, DATADOGHQ.com"] {
+            let vars = [("HTTPS_PROXY", "http://proxy"), ("NO_PROXY", no_proxy)];
+            assert!(!uses_proxy("https", host, env(&vars)), "{no_proxy}");
+        }
+        let vars = [("HTTPS_PROXY", "http://proxy"), ("no_proxy", "example.com,hq.com")];
+        assert!(uses_proxy("https", host, env(&vars)));
+    }
+
+    #[test]
+    fn splits_intake_urls() {
+        assert_eq!(
+            split_url("http://user@127.0.0.1:8126/proxy?x=1"),
+            ("http", "127.0.0.1:8126")
+        );
+        assert_eq!(split_url("https://api.datadoghq.com"), ("https", "api.datadoghq.com"));
+        assert_eq!(hostname("127.0.0.1:8126"), "127.0.0.1");
+        assert_eq!(hostname("[::1]:8126"), "::1");
+        assert_eq!(hostname("api.datadoghq.com"), "api.datadoghq.com");
     }
 
     #[test]
     fn probes_tcp_connections() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        assert!(tcp_connects(&format!("http://{address}")));
-        assert!(tcp_connects(&format!("http://user@{address}/proxy?x=1")));
-        assert!(!tcp_connects("http://unresolvable.invalid"));
+        assert!(connects_directly(&format!("http://{address}")));
+        assert!(connects_directly(&format!("http://user@{address}/proxy?x=1")));
+        assert!(!connects_directly("http://unresolvable.invalid"));
     }
 
     #[test]
