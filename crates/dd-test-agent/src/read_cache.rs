@@ -295,8 +295,9 @@ pub fn default_dir() -> PathBuf {
         .join("read-cache")
 }
 
-/// Matches the names the cache writes: `<key>.json`, `<key>.lock`, `<key>.takeover`
-/// and `<key>.tmp.<pid>.<nonce>`.
+/// Matches the names the cache cleans up: `<key>.json`, `<key>.lock` and
+/// `<key>.tmp.<pid>.<nonce>`. Takeover guards are never removed, since an agent
+/// may hold one.
 fn is_cache_file(name: &str) -> bool {
     let Some((key, suffix)) = name.split_once('.') else {
         return false;
@@ -307,7 +308,7 @@ fn is_cache_file(name: &str) -> bool {
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(pid, nonce)| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && hex(nonce))
     };
-    key.len() == 64 && hex(key) && (matches!(suffix, "json" | "lock" | "takeover") || temp(suffix))
+    key.len() == 64 && hex(key) && (suffix == "json" || suffix == "lock" || temp(suffix))
 }
 
 /// Takes the lock, or takes over a stale one. A waiter only takes over stale
@@ -345,8 +346,7 @@ fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
     replace(path, &lock).map_or(Acquire::Bypass, |()| Acquire::Owner(lock))
 }
 
-/// The open guard file, locked until it is dropped. Its modification time is
-/// refreshed so that cleanup leaves it alone.
+/// The open guard file, locked until it is dropped.
 #[cfg(unix)]
 fn takeover_guard(path: &Path) -> Option<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -362,7 +362,6 @@ fn takeover_guard(path: &Path) -> Option<File> {
     if !locked {
         return None;
     }
-    let _ = file.set_modified(std::time::SystemTime::now());
     Some(file)
 }
 
@@ -424,7 +423,9 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file: File = options.open(path)?;
-    file.write_all(bytes)
+    file.write_all(bytes).inspect_err(|_| {
+        let _ = fs::remove_file(path);
+    })
 }
 
 fn create_dir(dir: &Path) -> std::io::Result<()> {
@@ -653,17 +654,13 @@ mod tests {
     #[test]
     fn recognizes_its_own_files() {
         let key = "a".repeat(64);
-        for name in [
-            format!("{key}.json"),
-            format!("{key}.lock"),
-            format!("{key}.takeover"),
-            format!("{key}.tmp.42.1f"),
-        ] {
+        for name in [format!("{key}.json"), format!("{key}.lock"), format!("{key}.tmp.42.1f")] {
             assert!(is_cache_file(&name), "{name}");
         }
         for name in [
             "keep-me.txt".to_string(),
             "notes.json".to_string(),
+            format!("{key}.takeover"),
             format!("{key}.txt"),
             format!("{key}.tmp.42"),
             format!("{key}.tmp.x.1f"),
