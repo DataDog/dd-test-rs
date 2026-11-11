@@ -140,11 +140,16 @@ impl Unreachable {
     }
 
     /// An answer shows the host is reachable, so a timeout of a request that
-    /// was in flight meanwhile no longer stops requests to it.
+    /// was in flight meanwhile no longer stops requests to it, in this agent
+    /// or in the others.
     fn answered(&self, host: &str) {
         let mut hosts = lock(&self.hosts);
         lock(&self.answered).insert(host.to_string());
-        hosts.remove(host);
+        if hosts.remove(host) {
+            if let Some(cache) = &self.cache {
+                cache.mark_reachable(host);
+            }
+        }
     }
 }
 
@@ -696,11 +701,14 @@ mod tests {
     fn an_answer_after_a_warm_up_timeout_keeps_the_host_reachable() {
         let (url, _) = server(None);
         let dir = cache_dir("reconcile");
-        let transport = shared_with_probe(&url, &dir, |_| true);
+        let transport = shared(&url, &dir);
         transport.unreachable.warm_up_timed_out(&url, &url);
+        let other = shared(&url, &dir);
         assert!(transport.is_unreachable(Intake::TestCycle));
+        assert!(other.is_unreachable(Intake::TestCycle));
         transport.unreachable.answered(&url);
         assert!(!transport.is_unreachable(Intake::TestCycle));
+        assert!(!other.is_unreachable(Intake::TestCycle));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

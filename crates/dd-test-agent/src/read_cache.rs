@@ -228,6 +228,12 @@ impl ReadCache {
         }
     }
 
+    /// Withdraws the marker of `host` once it answered.
+    pub fn mark_reachable(&self, host: &str) {
+        let key = self.key("unreachable", &json!(host));
+        let _ = fs::remove_file(self.dir.join(format!("{key}.json")));
+    }
+
     /// True when an agent of the scope recently found `host` unreachable.
     pub fn is_unreachable(&self, host: &str) -> bool {
         self.read(&self.key("unreachable", &json!(host)), self.unreachable_ttl())
