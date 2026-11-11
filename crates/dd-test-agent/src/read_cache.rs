@@ -328,6 +328,9 @@ fn acquire(path: &Path, waiting: bool) -> Acquire {
     }
     match fs::read(path) {
         Ok(current) if is_stale(&current) => take_over(path, &current, lock),
+        // A lock this agent cannot read would otherwise hold it back for the
+        // full timeout on every miss.
+        Err(error) if error.kind() != ErrorKind::NotFound => Acquire::Bypass,
         _ => Acquire::Held,
     }
 }
@@ -767,6 +770,19 @@ mod tests {
         fs::write(&path, b"stale").unwrap();
         fs::create_dir(path.with_extension("takeover")).unwrap();
         assert!(matches!(acquire(&path, false), Acquire::Bypass));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bypasses_a_lock_it_cannot_read() {
+        let dir = temp_dir("unreadable");
+        create_dir(&dir).unwrap();
+        // A directory in place of the lock fails to read with an error other
+        // than NotFound, even when running as root.
+        let path = dir.join("k.lock");
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(acquire(&path, true), Acquire::Bypass));
         let _ = fs::remove_dir_all(&dir);
     }
 
