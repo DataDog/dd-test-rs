@@ -499,7 +499,7 @@ fn load_features(
         None => None,
     };
     let test_management = match properties {
-        Some(Ok(properties)) => Some(TestManagement {
+        Some(Ok(properties)) if !properties.is_empty() => Some(TestManagement {
             attempt_to_fix_retries: config
                 .attempt_to_fix_retries
                 .or(settings.test_management.attempt_to_fix_retries)
@@ -510,6 +510,10 @@ fn load_features(
                 .map(|(k, p)| ((k.suite, k.name), p))
                 .collect(),
         }),
+        Some(Ok(_)) => {
+            debug!("test management response is empty, Test Management is disabled");
+            None
+        }
         Some(Err(error)) => {
             warn!("could not fetch Test Management properties, Test Management is disabled: {error}");
             None
