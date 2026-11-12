@@ -250,6 +250,8 @@ impl Session {
                     tags.insert("test.failure_suppression_reason".into(), "quarantine".into());
                 } else if retry && mode == Mode::Normal {
                     tags.insert("test.failure_suppression_reason".into(), "auto_test_retry".into());
+                } else if (retry || any_pass) && mode == Mode::EarlyFlakeDetection {
+                    tags.insert("test.failure_suppression_reason".into(), "early_flake_detection".into());
                 }
                 record.error = Some(error_info(failure, &raw));
             }
@@ -677,6 +679,48 @@ mod tests {
         });
         assert_eq!(error.message, "actual");
         assert_eq!(error.stack, None);
+    }
+
+    #[test]
+    fn suppressed_early_flake_detection_failures_have_a_reason() {
+        let recorder = Arc::new(Recorder {
+            bootstrap: Bootstrap {
+                early_flake_detection: Some(EarlyFlakeDetection {
+                    buckets: vec![(Duration::from_secs(5), 3)],
+                    faulty_session_threshold: 30.0,
+                    known_tests: [("c".to_string(), "known".to_string())].into_iter().collect(),
+                }),
+                ..Bootstrap::default()
+            },
+            ..Recorder::default()
+        });
+        let session = Session::start(&hello(), Box::new(Arc::clone(&recorder))).unwrap();
+        let tests = [info("fail_then_pass"), info("pass_then_fail"), info("always_fails")];
+        let plans = session.plan(&tests);
+        for (test, plan) in tests.iter().zip(&plans) {
+            let mut calls = 0;
+            let _ = session.run(test, plan, true, &mut || {
+                calls += 1;
+                match (test.name.as_str(), calls) {
+                    ("fail_then_pass", 1) | ("pass_then_fail", 2) | ("always_fails", _) => Ok(Err("fails".into())),
+                    _ => Ok(Ok(())),
+                }
+            });
+        }
+        let records = recorder.records.lock().unwrap();
+        let reasons = |name: &str| -> Vec<Option<&str>> {
+            records
+                .iter()
+                .filter(|r| r.name == name && r.error.is_some())
+                .map(|r| r.tags.get("test.failure_suppression_reason").map(String::as_str))
+                .collect()
+        };
+        assert_eq!(reasons("fail_then_pass"), [Some("early_flake_detection")]);
+        assert_eq!(reasons("pass_then_fail"), [Some("early_flake_detection")]);
+        assert_eq!(
+            reasons("always_fails"),
+            [Some("early_flake_detection"), Some("early_flake_detection"), None]
+        );
     }
 
     #[test]
