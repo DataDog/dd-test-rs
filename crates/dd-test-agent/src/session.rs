@@ -291,7 +291,7 @@ impl AgentSession {
         let status = if complete { self.counts.status() } else { Status::Fail };
         let suites = std::mem::take(&mut self.suites);
         for (name, suite) in suites {
-            let mut span = self.container(Kind::Suite, "libtest.test_suite", &format!("{}.{name}", self.module));
+            let mut span = self.container(Kind::Suite, "libtest.test_suite", &format!("libtest.test_suite.{name}"));
             span.start = suite.start;
             span.duration = suite.end - suite.start;
             span.suite_id = suite.id;
@@ -304,7 +304,11 @@ impl AgentSession {
             self.container_events("event_type:suite", false);
         }
         for (kind, name, resource) in [
-            (Kind::Module, "libtest.test_module", self.module.clone()),
+            (
+                Kind::Module,
+                "libtest.test_module",
+                format!("libtest.test_module.{}", self.module),
+            ),
             (
                 Kind::Session,
                 "libtest.test_session",
