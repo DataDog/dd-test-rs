@@ -22,6 +22,7 @@ use std::time::Instant;
 pub const FRAMEWORK: &str = "libtest";
 const DEFAULT_ATTEMPT_TO_FIX_RETRIES: u32 = 20;
 const MAX_EVENTS_PER_PAYLOAD: usize = 1000;
+const EVENT_TAGS: [&str; 2] = ["test_framework:libtest", "event_type:test"];
 const INCOMPLETE_MESSAGE: &str = "The test binary exited before reporting all results";
 
 #[derive(Default)]
@@ -232,28 +233,9 @@ impl AgentSession {
         }
         span.set_metric("_dd.top_level", 1.0);
         if let Some(t) = &self.telemetry {
-            let mut tags = vec!["test_framework:libtest", "event_type:test"];
-            t.count("event_created", &tags);
-            for (tag, metric) in [
-                ("test.is_new", "is_new:true"),
-                ("test.is_retry", "is_retry:true"),
-                ("test.test_management.is_attempt_to_fix", "is_attempt_to_fix:true"),
-                ("test.test_management.is_quarantined", "is_quarantined:true"),
-                ("test.test_management.is_test_disabled", "is_disabled:true"),
-                ("test.has_failed_all_retries", "has_failed_all_retries:true"),
-            ] {
-                if record.tags.get(tag).is_some_and(|v| v == "true") {
-                    tags.push(metric);
-                }
-            }
-            if record
-                .tags
-                .get("test.early_flake.abort_reason")
-                .is_some_and(|v| v == "slow")
-            {
-                tags.push("early_flake_detection_abort_reason:slow");
-            }
-            t.count("event_finished", &tags);
+            t.count("event_created", &EVENT_TAGS);
+            let tags = event_finished_tags(&record.tags);
+            t.count("event_finished", &tags.iter().map(String::as_str).collect::<Vec<_>>());
         }
         span.meta.extend(record.tags);
         if let Some(error) = record.error {
@@ -422,6 +404,29 @@ fn upload(transport: Option<&Transport>, telemetry: Option<&Telemetry>, metadata
     }
 }
 
+fn event_finished_tags(tags: &BTreeMap<String, String>) -> Vec<String> {
+    let mut finished: Vec<String> = EVENT_TAGS.iter().map(|t| t.to_string()).collect();
+    for (tag, metric) in [
+        ("test.is_new", "is_new:true"),
+        ("test.is_retry", "is_retry:true"),
+        ("test.test_management.is_attempt_to_fix", "is_attempt_to_fix:true"),
+        ("test.test_management.is_quarantined", "is_quarantined:true"),
+        ("test.test_management.is_test_disabled", "is_disabled:true"),
+        ("test.has_failed_all_retries", "has_failed_all_retries:true"),
+    ] {
+        if tags.get(tag).is_some_and(|v| v == "true") {
+            finished.push(metric.to_string());
+        }
+    }
+    if let Some(reason) = tags.get("test.retry_reason") {
+        finished.push(format!("retry_reason:{reason}"));
+    }
+    if tags.get("test.early_flake.abort_reason").is_some_and(|v| v == "slow") {
+        finished.push("early_flake_detection_abort_reason:slow".to_string());
+    }
+    finished
+}
+
 /// `DD_TEST_SESSION_NAME`, else the test command, prefixed with the CI job name
 /// when there is one, like the other Test Optimization libraries.
 fn session_name(configured: Option<&str>, tags: &Tags, command: &str) -> String {
@@ -585,6 +590,32 @@ mod tests {
         assert_eq!(repo_root(dir.join("other").to_str(), &member), member);
         assert_eq!(repo_root(None, &member), member);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn event_finished_tags_describe_retries() {
+        let tags: BTreeMap<String, String> = [
+            ("test.is_retry", "true"),
+            ("test.retry_reason", "auto_test_retry"),
+            ("test.has_failed_all_retries", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(
+            event_finished_tags(&tags),
+            [
+                "test_framework:libtest",
+                "event_type:test",
+                "is_retry:true",
+                "has_failed_all_retries:true",
+                "retry_reason:auto_test_retry",
+            ]
+        );
+        assert_eq!(
+            event_finished_tags(&BTreeMap::new()),
+            ["test_framework:libtest", "event_type:test"]
+        );
     }
 
     #[test]
