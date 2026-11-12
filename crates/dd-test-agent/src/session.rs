@@ -15,7 +15,7 @@ use dd_test_core::protocol::{
 };
 use dd_test_core::{debug, warn};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,17 +80,13 @@ pub struct AgentSession {
 
 impl AgentSession {
     pub fn start(hello: &Hello, config: Config) -> (AgentSession, Bootstrap) {
-        let working_dir = PathBuf::from(&hello.working_dir);
+        let working_dir = canonical(Path::new(&hello.working_dir));
         let provider_tags = ci::provider_tags(&ProcessEnv);
         let nextest_run_id = std::env::var("NEXTEST_RUN_ID").ok();
         let cache = Scope::select(&provider_tags, nextest_run_id.as_deref(), hello.parent_pid)
             .map(|scope| ReadCache::new(read_cache::default_dir(), &scope, &config, &hello.library_version));
         let tags = ci::collect(&ProcessEnv, provider_tags, &working_dir, cache.as_ref());
-        let repo_root = tags
-            .get("ci.workspace_path")
-            .map(PathBuf::from)
-            .filter(|root| working_dir.starts_with(root))
-            .unwrap_or_else(|| working_dir.clone());
+        let repo_root = repo_root(tags.get("ci.workspace_path").map(String::as_str), &working_dir);
         let user_service = config.service.clone();
         let service = user_service
             .clone()
@@ -525,6 +521,18 @@ fn join<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Resu
         .unwrap_or_else(|_| Err("request thread panicked".to_string()))
 }
 
+/// The CI workspace when the tests run inside it, else the working directory.
+fn repo_root(workspace: Option<&str>, working_dir: &Path) -> PathBuf {
+    workspace
+        .map(|root| canonical(Path::new(root)))
+        .filter(|root| working_dir.starts_with(root))
+        .unwrap_or_else(|| working_dir.to_path_buf())
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn repository_name(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
     let name = trimmed.rsplit(['/', ':']).next()?;
@@ -555,6 +563,24 @@ mod tests {
         tags.insert("ci.job.name".into(), "unit".into());
         assert_eq!(session_name(None, &tags, "cargo test"), "unit-cargo test");
         assert_eq!(session_name(Some("custom"), &tags, "cargo test"), "custom");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_symlinks_in_the_ci_workspace_path() {
+        let dir = std::env::temp_dir().join(format!("dd-test-root-{:x}", new_id()));
+        let workspace = dir.join("workspace");
+        let member = workspace.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&workspace, &link).unwrap();
+        let member = member.canonicalize().unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+
+        assert_eq!(repo_root(link.to_str(), &member), workspace);
+        assert_eq!(repo_root(dir.join("other").to_str(), &member), member);
+        assert_eq!(repo_root(None, &member), member);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
