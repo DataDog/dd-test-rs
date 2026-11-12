@@ -420,12 +420,8 @@ pub fn libtest_result(pass: bool, should_panic: &ShouldPanic, last: RawResult) -
 fn error_info(failure: Failure, raw: &RawResult) -> ErrorInfo {
     let (kind, message, stack) = match failure {
         Failure::Panicked => {
-            let details = panics::take();
-            let message = details
-                .as_ref()
-                .map(|d| d.message.clone())
-                .or_else(|| payload(raw).map(panics::payload_message))
-                .unwrap_or_default();
+            let message = payload(raw).map(panics::payload_message).unwrap_or_default();
+            let details = panics::take().filter(|d| d.message == message);
             let stack = details.map(|d| match d.location {
                 Some(location) => format!("panicked at {location}\n{}", d.backtrace),
                 None => d.backtrace.to_string(),
@@ -650,6 +646,37 @@ mod tests {
         let records = recorder.records.lock().unwrap();
         let executions = |name: &str| records.iter().filter(|r| r.name == name).count();
         assert_eq!((executions("first"), executions("second")), (3, 1));
+    }
+
+    fn panic_error(attempt: &mut dyn FnMut() -> RawResult) -> ErrorInfo {
+        let recorder = Arc::new(Recorder::default());
+        let session = Session::start(&hello(), Box::new(Arc::clone(&recorder))).unwrap();
+        let test = info("panics");
+        let plan = session.plan(std::slice::from_ref(&test)).remove(0);
+        let _ = session.run(&test, &plan, true, attempt);
+        let records = recorder.records.lock().unwrap();
+        records[0].error.clone().unwrap()
+    }
+
+    #[test]
+    fn reports_the_panic_that_failed_the_test() {
+        let error = panic_error(&mut || std::panic::catch_unwind(|| panic!("boom {}", 1)).map(Ok));
+        assert_eq!(error.message, "boom 1");
+        assert!(error.stack.unwrap().starts_with("panicked at "));
+    }
+
+    #[test]
+    fn ignores_the_details_of_an_earlier_caught_panic() {
+        let error = panic_error(&mut || {
+            std::panic::catch_unwind(|| {
+                assert!(std::panic::catch_unwind(|| panic!("expected")).is_err());
+                let child = std::thread::spawn(|| panic!("actual"));
+                std::panic::resume_unwind(child.join().unwrap_err());
+            })
+            .map(Ok)
+        });
+        assert_eq!(error.message, "actual");
+        assert_eq!(error.stack, None);
     }
 
     #[test]
