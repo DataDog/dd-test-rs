@@ -241,7 +241,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "libdd-capabilities-impl",
- "libdd-common 7.0.0",
+ "libdd-common 10.0.0",
  "libdd-http-client",
  "libdd-telemetry",
  "ring",
@@ -972,6 +972,15 @@ dependencies = [
  "tokio",
  "tower-service",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "libdd-common"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03efb40c494f1fbbea365f94f82bfd6d15a92a342914372e873cc4724a1269e0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
