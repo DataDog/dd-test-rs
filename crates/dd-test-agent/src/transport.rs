@@ -115,8 +115,9 @@ impl Unreachable {
         self.mark_host(host, error, url, false);
     }
 
-    /// A warm-up request that times out after the host answered a real
-    /// request does not mark it.
+    /// A warm-up request only marks the host when a TCP connection to it
+    /// cannot be opened either and it has not answered a real request, since
+    /// a host that only stalls the warm-up may still accept uploads.
     fn warm_up_timed_out(&self, host: &str, url: &str) {
         self.mark_host(host, &HttpClientError::TimedOut, url, true);
     }
@@ -125,17 +126,20 @@ impl Unreachable {
     /// the host wait for the probe instead of releasing cache waiters early.
     fn mark_host(&self, host: &str, error: &HttpClientError, url: &str, warm_up: bool) {
         let mut hosts = lock(&self.hosts);
-        if warm_up && lock(&self.answered).contains(host) {
+        if hosts.contains(host) || (warm_up && lock(&self.answered).contains(host)) {
             return;
         }
-        if !hosts.insert(host.to_string()) {
+        let disconnected = matches!(error, HttpClientError::TimedOut)
+            && (warm_up || self.cache.is_some())
+            && !(self.proxied)(host)
+            && !(self.connects)(host);
+        if warm_up && !disconnected {
             return;
         }
+        hosts.insert(host.to_string());
         warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
-        if let (HttpClientError::TimedOut, Some(cache)) = (error, &self.cache) {
-            if !(self.proxied)(host) && !(self.connects)(host) {
-                cache.mark_unreachable(host);
-            }
+        if let (true, Some(cache)) = (disconnected, &self.cache) {
+            cache.mark_unreachable(host);
         }
     }
 
@@ -709,6 +713,17 @@ mod tests {
         transport.unreachable.answered(&url);
         assert!(!transport.is_unreachable(Intake::TestCycle));
         assert!(!other.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_warm_up_timeout_of_a_connecting_host_keeps_it_reachable() {
+        let (url, _) = server(None);
+        let dir = cache_dir("stalled-warm-up");
+        let transport = shared_with_probe(&url, &dir, |_| true);
+        transport.unreachable.warm_up_timed_out(&url, &url);
+        assert!(!transport.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
