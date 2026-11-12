@@ -141,14 +141,14 @@ impl Unreachable {
 
     /// An answer shows the host is reachable, so a timeout of a request that
     /// was in flight meanwhile no longer stops requests to it, in this agent
-    /// or in the others.
+    /// or in the others. An answer through a proxy says nothing about the
+    /// direct route, so it keeps the shared marker.
     fn answered(&self, host: &str) {
         let mut hosts = lock(&self.hosts);
         lock(&self.answered).insert(host.to_string());
-        if hosts.remove(host) {
-            if let Some(cache) = &self.cache {
-                cache.mark_reachable(host);
-            }
+        hosts.remove(host);
+        if let Some(cache) = self.cache.as_ref().filter(|_| !(self.proxied)(host)) {
+            cache.mark_reachable(host);
         }
     }
 }
@@ -709,6 +709,21 @@ mod tests {
         transport.unreachable.answered(&url);
         assert!(!transport.is_unreachable(Intake::TestCycle));
         assert!(!other.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_withdraws_the_marker_of_another_agent() {
+        let (url, _) = server(None);
+        let dir = cache_dir("withdraw");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let answering = shared(&url, &dir);
+        let mut proxied = shared(&url, &dir);
+        Arc::get_mut(&mut proxied.unreachable).unwrap().proxied = |_| true;
+        proxied.unreachable.answered(&url);
+        assert!(shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        answering.unreachable.answered(&url);
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
