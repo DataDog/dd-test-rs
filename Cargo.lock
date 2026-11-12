@@ -238,6 +238,7 @@ version = "0.1.0"
 dependencies = [
  "dd-test-core",
  "flate2",
+ "hyper-util",
  "libc",
  "libdd-capabilities-impl",
  "libdd-common 7.0.0",

@@ -2,20 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
+use crate::read_cache::ReadCache;
 use dd_test_core::debug;
 use dd_test_core::warn;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use hyper_util::client::proxy::matcher::Matcher;
 use libdd_http_client::{HttpClient, HttpClientError, HttpMethod, HttpRequest};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::Write;
-use std::sync::{Arc, Mutex, Once};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const ATTEMPTS: u32 = 3;
 const MAX_ERROR_BODY_CHARS: usize = 200;
 
@@ -74,11 +78,145 @@ pub struct Transport {
     site: String,
     intake_url: Option<String>,
     timeout: Duration,
-    unreachable: Mutex<HashSet<String>>,
+    unreachable: Arc<Unreachable>,
+}
+
+/// The hosts that did not answer. A timeout is shared through the read cache
+/// with the other agents of the run when a TCP connection to the host cannot be
+/// opened either, so they do not wait for the same timeout. A slow host is only
+/// skipped by the agent that waited for it. Shared markers describe the direct
+/// route, so an agent that reaches the host through a proxy ignores them.
+/// `hosts` is always locked before `answered`.
+struct Unreachable {
+    hosts: Mutex<HashSet<String>>,
+    answered: Mutex<HashSet<String>>,
+    warned: Mutex<HashSet<String>>,
+    cache: Option<ReadCache>,
+    proxied: fn(&str) -> bool,
+    connects: fn(&str) -> bool,
+}
+
+impl Unreachable {
+    fn contains(&self, host: &str) -> bool {
+        if lock(&self.hosts).contains(host) {
+            return true;
+        }
+        let shared = self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| !(self.proxied)(host) && cache.is_unreachable(host));
+        if shared && lock(&self.warned).insert(host.to_string()) {
+            warn!("{host} did not answer another test binary of this run, no requests are sent to it");
+        }
+        shared
+    }
+
+    fn mark(&self, host: &str, error: &HttpClientError, url: &str) {
+        self.mark_host(host, error, url, false);
+    }
+
+    /// A warm-up request only marks the host when a TCP connection to it
+    /// cannot be opened either and it has not answered a real request, since
+    /// a host that only stalls the warm-up may still accept uploads.
+    fn warm_up_timed_out(&self, host: &str, url: &str) {
+        self.mark_host(host, &HttpClientError::TimedOut, url, true);
+    }
+
+    /// Holds the lock until the marker is shared, so concurrent requests to
+    /// the host wait for the probe instead of releasing cache waiters early.
+    fn mark_host(&self, host: &str, error: &HttpClientError, url: &str, warm_up: bool) {
+        let mut hosts = lock(&self.hosts);
+        if hosts.contains(host) || (warm_up && lock(&self.answered).contains(host)) {
+            return;
+        }
+        let disconnected = matches!(error, HttpClientError::TimedOut)
+            && (warm_up || self.cache.is_some())
+            && !(self.proxied)(host)
+            && !(self.connects)(host);
+        if warm_up && !disconnected {
+            return;
+        }
+        hosts.insert(host.to_string());
+        warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
+        if let (true, Some(cache)) = (disconnected, &self.cache) {
+            cache.mark_unreachable(host);
+        }
+    }
+
+    /// An answer shows the host is reachable, so a timeout of a request that
+    /// was in flight meanwhile no longer stops requests to it, in this agent
+    /// or in the others. An answer through a proxy says nothing about the
+    /// direct route, so it keeps the shared marker.
+    fn answered(&self, host: &str) {
+        let mut hosts = lock(&self.hosts);
+        lock(&self.answered).insert(host.to_string());
+        hosts.remove(host);
+        if let Some(cache) = self.cache.as_ref().filter(|_| !(self.proxied)(host)) {
+            cache.mark_reachable(host);
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the HTTP client sends requests to `host`, a base URL, through a
+/// proxy. The proxy variables are matched as the client matches them.
+fn proxied(host: &str) -> bool {
+    static MATCHER: OnceLock<Matcher> = OnceLock::new();
+    uses_proxy(MATCHER.get_or_init(Matcher::from_env), host)
+}
+
+fn uses_proxy(matcher: &Matcher, host: &str) -> bool {
+    host.parse().is_ok_and(|uri| matcher.intercept(&uri).is_some())
+}
+
+/// The scheme and the `host[:port]` authority of a URL.
+fn split_url(url: &str) -> (&str, &str) {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("https", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    (scheme, authority.rsplit_once('@').map_or(authority, |(_, host)| host))
+}
+
+/// Whether a direct TCP connection to `host`, a base URL, opens within
+/// `PROBE_TIMEOUT`, name resolution included. Every address is tried at once.
+fn connects_directly(host: &str) -> bool {
+    let (scheme, authority) = split_url(host);
+    let has_port = !authority.ends_with(']')
+        && authority
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    let address = if has_port {
+        authority.to_string()
+    } else {
+        format!("{authority}:{}", if scheme == "http" { 80 } else { 443 })
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let (sender, results) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for address in address.to_socket_addrs().into_iter().flatten() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return;
+            };
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(TcpStream::connect_timeout(&address, remaining).is_ok());
+            });
+        }
+    });
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match results.recv_timeout(remaining) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 impl Transport {
-    pub fn new(config: &Config) -> Result<Transport, String> {
+    pub fn new(config: &Config, cache: Option<ReadCache>) -> Result<Transport, String> {
         static CRYPTO: Once = Once::new();
         CRYPTO.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -104,7 +242,14 @@ impl Transport {
             site: config.site.clone(),
             intake_url: config.intake_url.clone(),
             timeout: TIMEOUT,
-            unreachable: Mutex::new(HashSet::new()),
+            unreachable: Arc::new(Unreachable {
+                hosts: Mutex::new(HashSet::new()),
+                answered: Mutex::new(HashSet::new()),
+                warned: Mutex::new(HashSet::new()),
+                cache,
+                proxied,
+                connects: connects_directly,
+            }),
         })
     }
 
@@ -115,21 +260,11 @@ impl Transport {
     }
 
     fn is_host_unreachable(&self, host: &str) -> bool {
-        self.unreachable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(host)
+        self.unreachable.contains(host)
     }
 
     fn mark_unreachable(&self, host: &str, error: &HttpClientError, url: &str) {
-        if self
-            .unreachable
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(host.to_string())
-        {
-            warn!("{url}: {error}. {host} is unreachable, no further requests are sent to it");
-        }
+        self.unreachable.mark(host, error, url);
     }
 
     /// The scheme and host requests for `intake` go to.
@@ -140,17 +275,26 @@ impl Transport {
     }
 
     /// Opens the connection to the host serving `intake` in the background, so
-    /// the first request to it does not wait for TCP and TLS setup.
+    /// the first request to it does not wait for TCP and TLS setup. A timeout
+    /// marks the host unreachable unless it answered a request meanwhile.
     pub fn warm_up(&self, intake: Intake) {
+        let host = self.host(intake);
+        if self.is_host_unreachable(&host) {
+            return;
+        }
         let client = Arc::clone(&self.client);
-        let url = format!("{}/", self.host(intake));
+        let unreachable = Arc::clone(&self.unreachable);
+        let url = format!("{host}/");
         let request = HttpRequest::new(HttpMethod::Head, url.clone())
             .with_headers([("dd-api-key".to_string(), self.api_key.clone())])
             .with_timeout(self.timeout);
         self.runtime.spawn(async move {
             let started = Instant::now();
-            let _ = client.send(request).await;
+            let result = client.send(request).await;
             debug!("opened the connection to {url} in {:?}", started.elapsed());
+            if let Err(HttpClientError::TimedOut) = result {
+                let _ = tokio::task::spawn_blocking(move || unreachable.warm_up_timed_out(&host, &url)).await;
+            }
         });
     }
 
@@ -197,10 +341,12 @@ impl Transport {
             let elapsed = started.elapsed();
             let retry = match result {
                 Ok(response) => {
+                    self.unreachable.answered(&host);
                     debug!("POST {url}: {} bytes in {elapsed:?}", response.body().len());
                     return Ok(response.body().to_vec());
                 }
                 Err(HttpClientError::RequestFailed { status, body }) => {
+                    self.unreachable.answered(&host);
                     last_error = RequestError {
                         status: Some(status),
                         message: format!("{url} returned {status}: {}", printable_body(&body)),
@@ -262,7 +408,7 @@ mod tests {
             "DD_CIVISIBILITY_AGENTLESS_URL" => intake_url.clone(),
             _ => None,
         });
-        let mut transport = Transport::new(&config).unwrap();
+        let mut transport = Transport::new(&config, None).unwrap();
         transport.timeout = Duration::from_millis(200);
         transport
     }
@@ -427,6 +573,191 @@ mod tests {
         transport.mark_unreachable(&transport.host(Intake::Api), &HttpClientError::TimedOut, "u");
         assert!(transport.is_unreachable(Intake::Api));
         assert!(!transport.is_unreachable(Intake::TestCycle));
+    }
+
+    fn shared(url: &str, dir: &std::path::Path) -> Transport {
+        shared_with_probe(url, dir, |_| false)
+    }
+
+    fn shared_with_probe(url: &str, dir: &std::path::Path, connects: fn(&str) -> bool) -> Transport {
+        let config = Config::from_lookup(|key| match key {
+            "DD_API_KEY" => Some("k".into()),
+            "DD_CIVISIBILITY_AGENTLESS_URL" => Some(url.to_string()),
+            _ => None,
+        });
+        let scope = crate::read_cache::Scope::select(&crate::ci::Tags::new(), None, Some(1)).unwrap();
+        let cache = ReadCache::new(dir.to_path_buf(), &scope, &config, "0");
+        let mut transport = Transport::new(&config, Some(cache)).unwrap();
+        transport.timeout = Duration::from_millis(200);
+        let unreachable = Arc::get_mut(&mut transport.unreachable).unwrap();
+        unreachable.proxied = |_| false;
+        unreachable.connects = connects;
+        transport
+    }
+
+    fn cache_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dd-test-transport-{name}-{:x}", crate::ids::new_id()))
+    }
+
+    #[test]
+    fn timeouts_are_shared_with_the_other_agents() {
+        let (url, connections) = server(None);
+        let dir = cache_dir("timeout");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let other = shared(&url, &dir);
+        assert!(other.is_unreachable(Intake::TestCycle));
+        assert!(post(&other).unwrap_err().message.contains("skipped"));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_connections_are_not_shared() {
+        let url = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let dir = cache_dir("refused");
+        let first = shared(&url, &dir);
+        assert!(post(&first).is_err());
+        assert!(first.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_warm_up_timeout_marks_the_host_unreachable() {
+        let (url, _) = server(None);
+        let dir = cache_dir("warm-up");
+        let transport = shared(&url, &dir);
+        transport.warm_up(Intake::TestCycle);
+        let other = shared(&url, &dir);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !other.is_unreachable(Intake::TestCycle) {
+            assert!(Instant::now() < deadline, "the warm-up times out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(transport.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slow_responses_are_not_shared() {
+        let (url, _) = server(None);
+        let dir = cache_dir("slow");
+        let first = shared_with_probe(&url, &dir, connects_directly);
+        assert!(post(&first).is_err());
+        assert!(first.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markers_from_other_agents_expire() {
+        let (url, _) = server(None);
+        let dir = cache_dir("expire");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let other = shared(&url, &dir);
+        assert!(other.is_unreachable(Intake::TestCycle));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!other.is_unreachable(Intake::TestCycle));
+    }
+
+    #[test]
+    fn a_warm_up_timeout_after_an_answer_is_ignored() {
+        let (url, _) = server(None);
+        let dir = cache_dir("answered");
+        let transport = shared(&url, &dir);
+        transport.unreachable.answered(&url);
+        transport.unreachable.warm_up_timed_out(&url, &url);
+        assert!(!transport.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_proxies_for_the_scheme() {
+        let https = |no: &str| Matcher::builder().https("http://proxy").no(no).build();
+        assert!(uses_proxy(&https(""), "https://api.datadoghq.com"));
+        assert!(!uses_proxy(&https(""), "http://api.datadoghq.com"));
+        let all = Matcher::builder().all("http://proxy").build();
+        assert!(uses_proxy(&all, "http://user@127.0.0.1:8126/proxy?x=1"));
+        assert!(!uses_proxy(&Matcher::builder().build(), "https://api.datadoghq.com"));
+        for no in ["*", "api.datadoghq.com", ".datadoghq.com", "localhost, DATADOGHQ.com"] {
+            assert!(!uses_proxy(&https(no), "https://api.datadoghq.com"), "{no}");
+        }
+        assert!(uses_proxy(&https("example.com,hq.com"), "https://api.datadoghq.com"));
+        assert!(!uses_proxy(&https("10.0.0.0/8"), "https://10.1.2.3:8126"));
+        assert!(uses_proxy(&https("10.0.0.0/8"), "https://11.1.2.3:8126"));
+    }
+
+    #[test]
+    fn agents_using_a_proxy_ignore_markers_of_the_direct_route() {
+        let (url, _) = server(None);
+        let dir = cache_dir("proxied");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let mut proxied = shared(&url, &dir);
+        Arc::get_mut(&mut proxied.unreachable).unwrap().proxied = |_| true;
+        assert!(!proxied.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_after_a_warm_up_timeout_keeps_the_host_reachable() {
+        let (url, _) = server(None);
+        let dir = cache_dir("reconcile");
+        let transport = shared(&url, &dir);
+        transport.unreachable.warm_up_timed_out(&url, &url);
+        let other = shared(&url, &dir);
+        assert!(transport.is_unreachable(Intake::TestCycle));
+        assert!(other.is_unreachable(Intake::TestCycle));
+        transport.unreachable.answered(&url);
+        assert!(!transport.is_unreachable(Intake::TestCycle));
+        assert!(!other.is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_warm_up_timeout_of_a_connecting_host_keeps_it_reachable() {
+        let (url, _) = server(None);
+        let dir = cache_dir("stalled-warm-up");
+        let transport = shared_with_probe(&url, &dir, |_| true);
+        transport.unreachable.warm_up_timed_out(&url, &url);
+        assert!(!transport.is_unreachable(Intake::TestCycle));
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_answer_withdraws_the_marker_of_another_agent() {
+        let (url, _) = server(None);
+        let dir = cache_dir("withdraw");
+        assert!(post(&shared(&url, &dir)).is_err());
+        let answering = shared(&url, &dir);
+        let mut proxied = shared(&url, &dir);
+        Arc::get_mut(&mut proxied.unreachable).unwrap().proxied = |_| true;
+        proxied.unreachable.answered(&url);
+        assert!(shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        answering.unreachable.answered(&url);
+        assert!(!shared(&url, &dir).is_unreachable(Intake::TestCycle));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn splits_intake_urls() {
+        assert_eq!(
+            split_url("http://user@127.0.0.1:8126/proxy?x=1"),
+            ("http", "127.0.0.1:8126")
+        );
+        assert_eq!(split_url("https://api.datadoghq.com"), ("https", "api.datadoghq.com"));
+    }
+
+    #[test]
+    fn probes_tcp_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert!(connects_directly(&format!("http://{address}")));
+        assert!(connects_directly(&format!("http://user@{address}/proxy?x=1")));
+        assert!(!connects_directly("http://unresolvable.invalid"));
     }
 
     #[test]

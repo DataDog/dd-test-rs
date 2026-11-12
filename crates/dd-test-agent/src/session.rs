@@ -148,7 +148,7 @@ impl AgentSession {
                 .filter_map(|(key, value)| Some((key.strip_prefix("test.configuration.")?.to_string(), value.clone())))
                 .collect(),
         };
-        let transport = match Transport::new(&config) {
+        let transport = match Transport::new(&config, cache.clone()) {
             Ok(transport) => {
                 transport.warm_up(Intake::TestCycle);
                 Some(transport)
@@ -450,9 +450,6 @@ fn load_features(
     config: &Config,
     module: &str,
 ) -> Bootstrap {
-    if transport.is_unreachable(Intake::Api) {
-        return Bootstrap::default();
-    }
     let settings = match api::fetch_settings(transport, cache, context, telemetry) {
         Ok(settings) => settings,
         Err(error) => {
@@ -620,6 +617,42 @@ mod tests {
             event_finished_tags(&BTreeMap::new()),
             ["test_framework:libtest", "event_type:test"]
         );
+    }
+
+    #[test]
+    fn features_load_from_the_cache_when_another_agent_found_the_api_unreachable() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0; 65536]);
+                let body = r#"{"data":{"attributes":{"flaky_test_retries_enabled":true}}}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let config = Config::from_lookup(|key| match key {
+            "DD_API_KEY" => Some("k".into()),
+            "DD_CIVISIBILITY_AGENTLESS_URL" => Some(url.clone()),
+            _ => None,
+        });
+        let dir = std::env::temp_dir().join(format!("dd-test-session-cache-{:x}", new_id()));
+        let scope = Scope::select(&Tags::new(), None, Some(1)).unwrap();
+        let cache = ReadCache::new(dir.clone(), &scope, &config, "0");
+        let context = RequestContext::default();
+        let load = |transport: &Transport| load_features(transport, Some(&cache), None, &context, &config, "m");
+
+        let first = Transport::new(&config, Some(cache.clone())).unwrap();
+        assert!(load(&first).auto_test_retries.is_some());
+        cache.mark_unreachable(&url);
+        let next = Transport::new(&config, Some(cache.clone())).unwrap();
+        assert!(next.is_unreachable(Intake::Api));
+        assert!(load(&next).auto_test_retries.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

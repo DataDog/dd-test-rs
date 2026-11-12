@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 dd-test-core = { path = "../dd-test-core", version = "0.1.0" }
 flate2 = "1"
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
 libdd-http-client = "2"
 ring = "0.17"
 rmp-serde = "1.3"
