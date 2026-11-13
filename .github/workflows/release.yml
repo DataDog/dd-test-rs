@@ -101,7 +101,7 @@ jobs:
           set -o pipefail
           cargo +stable test --test integration adds 2>&1 | tee "$RUNNER_TEMP/smoke.log"
           grep -F "tests are not reported to Datadog: DD_API_KEY is not set" "$RUNNER_TEMP/smoke.log"
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-about@0.9.3
       - name: Package
