@@ -102,9 +102,10 @@ fn start_session(crate_name: &str, working_dir: &Path) -> Result<Session, String
     let agent = locate_agent(AGENT_PATH).ok_or("the dd-test-wrapper agent was not found")?;
     let client = AgentClient::spawn(&agent)?;
     let hello = Hello {
-        module: std::env::var("CARGO_PKG_NAME")
-            .ok()
-            .filter(|m| !m.is_empty())
+        module: ["DD_TEST_MODULE", "CARGO_PKG_NAME"]
+            .iter()
+            .filter_map(|name| std::env::var(name).ok())
+            .find(|m| !m.is_empty())
             .unwrap_or_else(|| crate_name.to_string()),
         crate_name: crate_name.to_string(),
         binary: std::env::current_exe()

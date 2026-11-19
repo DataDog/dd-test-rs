@@ -154,6 +154,7 @@ Git metadata comes from your CI provider and from the local checkout. Use these 
 | `DD_CIVISIBILITY_AGENTLESS_URL` | derived from `DD_SITE` | Send every request to this URL instead, such as a proxy. |
 | `DD_INSTRUMENTATION_TELEMETRY_URL` | derived from `DD_SITE` | Send telemetry to this URL instead. |
 | `DD_TEST_AGENT` | the installed wrapper | Path of the `dd-test-wrapper` binary that test binaries start. Set it when you run test binaries on another machine, or after moving the wrapper. |
+| `DD_TEST_MODULE` | the Cargo package | The test module of every test. Set it to the package name when you run test binaries without Cargo or nextest. |
 | `DD_TEST_READ_CACHE_DIR` | your user cache directory | Where test binaries of the same run share Datadog responses and git metadata. |
 
 ## What is supported
@@ -191,6 +192,7 @@ Use `cargo test` to report one test session per test binary.
   - tests that use a custom harness (`harness = false` or `#![test_runner]`);
   - test builds with `panic = "abort"`.
 - Results can be lost if the test process is killed with `SIGKILL`, or if Ctrl-C reaches the whole process group.
+- Test binaries run without Cargo or nextest, such as a binary copied to another machine, report the crate name as the test module, not the package name. Their tests then look new to Early Flake Detection, and Test Management settings do not apply to them. Set `DD_TEST_MODULE` to the package name to fix this.
 - Windows is not supported yet.
 
 ## Troubleshooting
