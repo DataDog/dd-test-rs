@@ -202,7 +202,6 @@ impl Session {
         let mut atr_admitted = false;
         loop {
             panics::clear();
-            let ids = (new_id(), new_id());
             let start = now_nanos();
             let clock = Instant::now();
             let raw = attempt();
@@ -234,7 +233,6 @@ impl Session {
                 };
 
             let mut record = self.record(test, plan, start);
-            (record.trace_id, record.span_id) = ids;
             record.duration = duration.as_nanos() as i64;
             let tags = &mut record.tags;
             tags.insert("test.status".into(), if passed { "pass" } else { "fail" }.into());
@@ -626,6 +624,8 @@ mod tests {
         assert_eq!(records[0].outcome, None);
         assert_eq!(records[1].tags["test.retry_reason"], "auto_test_retry");
         assert_eq!(records[1].outcome, Some(Status::Pass));
+        assert_ne!(records[0].trace_id, records[1].trace_id);
+        assert_ne!(records[0].span_id, records[1].span_id);
         assert!(recorder.finished.lock().unwrap().is_some());
     }
 
