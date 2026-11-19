@@ -291,6 +291,23 @@ fn names_resources_like_other_libraries() {
 }
 
 #[test]
+fn dd_test_module_overrides_the_cargo_package() {
+    let run = run_fixture(
+        &["test", "--quiet", "--test", "integration", "--", "--exact", "adds"],
+        &[("DD_TEST_MODULE", "custom-module")],
+    );
+    assert!(run.output.status.success());
+    let recorded = run.recorded.lock().unwrap();
+    for kind in ["test", "test_module_end"] {
+        let events = events_of(&recorded.events, kind);
+        assert!(!events.is_empty());
+        for event in events {
+            assert_eq!(meta(event, "test.module"), "custom-module");
+        }
+    }
+}
+
+#[test]
 fn adds_dd_tags_to_events_and_custom_configurations_to_requests() {
     let run = run_fixture(
         &["test", "--quiet", "--test", "integration"],
