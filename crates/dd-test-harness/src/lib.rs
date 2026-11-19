@@ -16,6 +16,7 @@ pub use real::*;
 
 use dd_test_core::backend::{locate_agent, AgentClient};
 use dd_test_core::engine::{self, Action, RawResult, Session, TestInfo};
+use dd_test_core::env::flag;
 use dd_test_core::protocol::Hello;
 use dd_test_core::{debug, warn};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -31,14 +32,6 @@ const LIBRARY_VERSION: &str = match option_env!("DD_TEST_LIBRARY_VERSION") {
     None => "unknown",
 };
 const AGENT_PATH: Option<&str> = option_env!("DD_TEST_AGENT_PATH");
-
-fn flag(name: &str) -> Option<bool> {
-    match std::env::var(name).ok()?.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => Some(true),
-        "0" | "false" => Some(false),
-        _ => None,
-    }
-}
 
 fn enabled() -> bool {
     dd_test_core::log::set_debug(flag("DD_TRACE_DEBUG").unwrap_or(false));

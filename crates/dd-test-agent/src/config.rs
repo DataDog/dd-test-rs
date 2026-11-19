@@ -1,6 +1,7 @@
 // Copyright 2026-Present Datadog, Inc. https://www.datadoghq.com/
 // SPDX-License-Identifier: Apache-2.0
 
+use dd_test_core::env::parse_bool;
 use std::collections::BTreeMap;
 use std::env;
 
@@ -69,14 +70,6 @@ fn parse_tags(value: &str) -> BTreeMap<String, String> {
             (!key.is_empty()).then(|| (key.to_string(), value.trim().to_string()))
         })
         .collect()
-}
-
-pub fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => Some(true),
-        "0" | "false" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
