@@ -21,7 +21,6 @@ use std::time::Instant;
 
 pub const FRAMEWORK: &str = "libtest";
 const DEFAULT_ATTEMPT_TO_FIX_RETRIES: u32 = 20;
-const MAX_EVENTS_PER_PAYLOAD: usize = 1000;
 const EVENT_TAGS: [&str; 2] = ["test_framework:libtest", "event_type:test"];
 const INCOMPLETE_MESSAGE: &str = "The test binary exited before reporting all results";
 
@@ -364,43 +363,41 @@ impl AgentSession {
 
 fn upload(transport: Option<&Transport>, telemetry: Option<&Telemetry>, metadata: &Metadata, spans: &[Span]) {
     let Some(transport) = transport else { return };
-    for chunk in spans.chunks(MAX_EVENTS_PER_PAYLOAD) {
-        if transport.is_unreachable(Intake::TestCycle) {
-            debug!("dropped {} events, Datadog is unreachable", chunk.len());
-            continue;
-        }
-        let payload = encode_payload(metadata, chunk);
-        let started = Instant::now();
-        let result = transport.post(
-            Intake::TestCycle,
-            "/api/v2/citestcycle",
-            "application/msgpack",
-            &payload,
-            true,
+    if transport.is_unreachable(Intake::TestCycle) {
+        debug!("dropped {} events, Datadog is unreachable", spans.len());
+        return;
+    }
+    let payload = encode_payload(metadata, spans);
+    let started = Instant::now();
+    let result = transport.post(
+        Intake::TestCycle,
+        "/api/v2/citestcycle",
+        "application/msgpack",
+        &payload,
+        true,
+    );
+    if let Some(t) = telemetry {
+        let endpoint = "endpoint:test_cycle";
+        t.count("endpoint_payload.requests", &[endpoint, "rq_compressed:true"]);
+        t.distribution(
+            "endpoint_payload.requests_ms",
+            started.elapsed().as_secs_f64() * 1000.0,
+            &[endpoint],
         );
-        if let Some(t) = telemetry {
-            let endpoint = "endpoint:test_cycle";
-            t.count("endpoint_payload.requests", &[endpoint, "rq_compressed:true"]);
-            t.distribution(
-                "endpoint_payload.requests_ms",
-                started.elapsed().as_secs_f64() * 1000.0,
-                &[endpoint],
+        t.distribution("endpoint_payload.bytes", payload.len() as f64, &[endpoint]);
+        t.distribution("endpoint_payload.events_count", spans.len() as f64, &[endpoint]);
+        if let Err(error) = &result {
+            let mut tags = telemetry::error_tags(error.status);
+            tags.insert(0, endpoint.to_string());
+            t.count(
+                "endpoint_payload.requests_errors",
+                &tags.iter().map(String::as_str).collect::<Vec<_>>(),
             );
-            t.distribution("endpoint_payload.bytes", payload.len() as f64, &[endpoint]);
-            t.distribution("endpoint_payload.events_count", chunk.len() as f64, &[endpoint]);
-            if let Err(error) = &result {
-                let mut tags = telemetry::error_tags(error.status);
-                tags.insert(0, endpoint.to_string());
-                t.count(
-                    "endpoint_payload.requests_errors",
-                    &tags.iter().map(String::as_str).collect::<Vec<_>>(),
-                );
-            }
         }
-        match result {
-            Ok(_) => debug!("sent {} events ({} bytes)", chunk.len(), payload.len()),
-            Err(error) => warn!("could not send test results to Datadog: {error}"),
-        }
+    }
+    match result {
+        Ok(_) => debug!("sent {} events ({} bytes)", spans.len(), payload.len()),
+        Err(error) => warn!("could not send test results to Datadog: {error}"),
     }
 }
 
