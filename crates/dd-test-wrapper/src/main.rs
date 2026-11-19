@@ -7,6 +7,7 @@
 //! through unchanged, except test harness builds, which get
 //! `--extern test=<harness>` so the generated `main` calls our libtest shim.
 //! Instrumented test binaries run `dd-test-wrapper agent` to report results.
+//! `dd-test-wrapper --version` prints the version.
 
 mod harness;
 
@@ -22,6 +23,10 @@ fn main() -> ExitCode {
     };
     if rustc == "agent" {
         return ExitCode::from(dd_test_agent::run().clamp(0, 255) as u8);
+    }
+    if rustc == "--version" || rustc == "-V" {
+        println!("dd-test-wrapper {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
     }
     let mut args: Vec<OsString> = args.collect();
     let Some(extra) = injection(&rustc, &args) else {

@@ -45,6 +45,8 @@ curl -fsSL https://github.com/DataDog/dd-test-rs/releases/latest/download/dd-tes
 
 In GitHub Actions, you can download it with the `gh` command line tool instead. See [GitHub Actions](#github-actions).
 
+Run `dd-test-wrapper --version` to print the installed version.
+
 ## Setup
 
 Set these environment variables, then run your tests as usual:
