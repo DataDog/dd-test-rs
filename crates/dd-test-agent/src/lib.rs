@@ -10,6 +10,7 @@
 pub mod api;
 pub mod ci;
 pub mod config;
+pub use dd_test_core::env;
 pub mod event;
 pub mod read_cache;
 pub use dd_test_core::ids;

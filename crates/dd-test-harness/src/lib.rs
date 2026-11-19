@@ -16,8 +16,10 @@ pub use real::*;
 
 use dd_test_core::backend::{locate_agent, AgentClient};
 use dd_test_core::engine::{self, Action, RawResult, Session, TestInfo};
+use dd_test_core::env::flag;
 use dd_test_core::protocol::Hello;
 use dd_test_core::{debug, warn};
+use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,14 +33,6 @@ const LIBRARY_VERSION: &str = match option_env!("DD_TEST_LIBRARY_VERSION") {
     None => "unknown",
 };
 const AGENT_PATH: Option<&str> = option_env!("DD_TEST_AGENT_PATH");
-
-fn flag(name: &str) -> Option<bool> {
-    match std::env::var(name).ok()?.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" => Some(true),
-        "0" | "false" => Some(false),
-        _ => None,
-    }
-}
 
 fn enabled() -> bool {
     dd_test_core::log::set_debug(flag("DD_TRACE_DEBUG").unwrap_or(false));
@@ -149,9 +143,17 @@ fn prepare(args: &[String], tests: &mut [TestDescAndFn]) -> Option<Arc<Session>>
         }
     };
 
+    let mut source_files = HashMap::new();
     let infos: Vec<TestInfo> = selected
         .iter()
-        .map(|i| test_info(&tests[*i].desc, &opts, &crate_name, &working_dir, session.repo_root()))
+        .map(|i| {
+            let desc = &tests[*i].desc;
+            let source_file = source_files
+                .entry(desc.source_file)
+                .or_insert_with(|| source_file(desc.source_file, &working_dir, session.repo_root()))
+                .clone();
+            test_info(desc, &opts, &crate_name, source_file)
+        })
         .collect();
     let plans = session.plan(&infos);
 
@@ -281,18 +283,12 @@ fn is_selected(opts: &real::test::TestOpts, test: &TestDescAndFn) -> bool {
     !(matches!(opts.run_ignored, RunIgnored::Only) && !test.desc.ignore)
 }
 
-fn test_info(
-    desc: &TestDesc,
-    opts: &real::test::TestOpts,
-    crate_name: &str,
-    working_dir: &Path,
-    repo_root: Option<&Path>,
-) -> TestInfo {
+fn test_info(desc: &TestDesc, opts: &real::test::TestOpts, crate_name: &str, source_file: Option<String>) -> TestInfo {
     let (suite, name) = engine::split_test_name(crate_name, desc.name.as_slice());
     TestInfo {
         suite,
         name,
-        source_file: source_file(desc.source_file, working_dir, repo_root),
+        source_file,
         start_line: desc.start_line as u32,
         end_line: desc.end_line as u32,
         should_panic: match desc.should_panic {

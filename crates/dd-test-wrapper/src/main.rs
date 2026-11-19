@@ -73,7 +73,7 @@ fn track_wrapper(dep_info: &std::path::Path) {
 }
 
 fn debug(message: impl std::fmt::Display) {
-    if std::env::var("DD_TRACE_DEBUG").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+    if dd_test_agent::env::flag("DD_TRACE_DEBUG").unwrap_or(false) {
         eprintln!("[dd-test-wrapper] {message}");
     }
 }

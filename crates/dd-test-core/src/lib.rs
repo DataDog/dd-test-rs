@@ -12,6 +12,7 @@
 pub mod log;
 pub mod backend;
 pub mod engine;
+pub mod env;
 pub mod ids;
 pub mod json;
 pub mod panic;
