@@ -157,6 +157,7 @@ fn prepare(args: &[String], tests: &mut [TestDescAndFn]) -> Option<Arc<Session>>
         })
         .collect();
     let plans = session.plan(&infos);
+    let retries = time_check_allows_retries(&opts);
 
     for ((index, info), plan) in selected.into_iter().zip(infos).zip(plans) {
         let test = &mut tests[index];
@@ -169,7 +170,7 @@ fn prepare(args: &[String], tests: &mut [TestDescAndFn]) -> Option<Arc<Session>>
             }
             Action::Run => {
                 let original = std::mem::replace(&mut test.testfn, dyn_test_fn(|| Ok(())));
-                test.testfn = instrument(original, Arc::clone(&session), info, plan);
+                test.testfn = instrument(original, Arc::clone(&session), info, plan, retries);
             }
         }
     }
@@ -227,9 +228,30 @@ fn dyn_test_fn(f: impl Fn() -> Result<(), String> + Send + Sync + 'static) -> Te
     DynTestFn(Arc::new(f))
 }
 
-fn instrument(original: TestFn, session: Arc<Session>, info: TestInfo, plan: engine::TestPlan) -> TestFn {
+/// libtest times the whole test function, which runs every execution of a test.
+fn time_check_allows_retries(opts: &real::test::TestOpts) -> bool {
+    match &opts.time_options {
+        Some(time) if time.error_on_excess => {
+            warn!("--ensure-time is set, so each test runs once, without retries");
+            false
+        }
+        Some(_) => {
+            warn!("--report-time reports the total time of all executions of a retried test");
+            true
+        }
+        None => true,
+    }
+}
+
+fn instrument(
+    original: TestFn,
+    session: Arc<Session>,
+    info: TestInfo,
+    plan: engine::TestPlan,
+    retries: bool,
+) -> TestFn {
     let (retryable, call) = match callable(original) {
-        Ok(callable) => callable,
+        Ok((retryable, call)) => (retryable && retries, call),
         Err(other) => return other,
     };
     let call = Mutex::new(call);

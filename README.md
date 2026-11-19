@@ -172,6 +172,7 @@ Each test binary is reported as a test session:
 - When you filter tests, such as with `cargo test my_test`, test binaries without a matching test are not reported.
 - The wrapper works together with `RUSTC_WRAPPER` tools such as sccache. sccache still caches your dependencies, but not your workspace crates.
 - Retries run in the same process, right after the failed execution. A retried test shares process state, such as statics, with its earlier executions.
+- libtest times all executions of a test together. With the unstable `--ensure-time` option, each test runs once, without Auto Test Retries, Early Flake Detection or Attempt to Fix, so the time limit applies to a single execution. With `--report-time` alone, retries still run and the reported time covers all executions.
 
 ### cargo nextest
 

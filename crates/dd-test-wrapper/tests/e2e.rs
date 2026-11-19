@@ -367,6 +367,46 @@ fn results_survive_the_test_binary_exiting() {
 }
 
 #[test]
+fn ensure_time_disables_retries_and_report_time_keeps_them() {
+    let args = |time: &'static str| {
+        [
+            "test",
+            "--quiet",
+            "--lib",
+            "--",
+            "-Zunstable-options",
+            time,
+            "--exact",
+            "tests::flaky_once",
+            "tests::nested::deep",
+        ]
+    };
+    let env = [("RUSTC_BOOTSTRAP", "1")];
+
+    let ensure = run_fixture(&args("--ensure-time"), &env);
+    let stderr = String::from_utf8_lossy(&ensure.output.stderr);
+    assert!(!ensure.output.status.success(), "the flaky failure is not retried");
+    assert!(
+        stderr.contains("--ensure-time is set, so each test runs once, without retries"),
+        "{stderr}"
+    );
+    let recorded = ensure.recorded.lock().unwrap();
+    assert_eq!(tests_named(&recorded.events, "basic::tests", "flaky_once").len(), 1);
+    assert_eq!(tests_named(&recorded.events, "basic::tests::nested", "deep").len(), 1);
+
+    let report = run_fixture(&args("--report-time"), &env);
+    let stderr = String::from_utf8_lossy(&report.output.stderr);
+    assert!(report.output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("--report-time reports the total time of all executions"),
+        "{stderr}"
+    );
+    let recorded = report.recorded.lock().unwrap();
+    assert_eq!(tests_named(&recorded.events, "basic::tests", "flaky_once").len(), 2);
+    assert_eq!(tests_named(&recorded.events, "basic::tests::nested", "deep").len(), 3);
+}
+
+#[test]
 fn reports_and_controls_the_fixture() {
     let run = run_fixture(&["test", "--no-fail-fast", "--quiet"], &[]);
     let output = &run.output;
