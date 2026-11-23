@@ -234,7 +234,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "dd-test-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dd-test-core",
  "flate2",
@@ -254,11 +254,11 @@ dependencies = [
 
 [[package]]
 name = "dd-test-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "dd-test-wrapper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dd-test-agent",
  "flate2",
