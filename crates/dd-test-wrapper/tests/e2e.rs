@@ -443,62 +443,68 @@ fn nextest_reports_one_session_for_the_run() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let recorded = run.recorded.lock().unwrap();
-    let events = &recorded.events;
+    {
+        let recorded = run.recorded.lock().unwrap();
+        let events = &recorded.events;
 
-    assert_eq!(events_of(events, "test_session_end").len(), 1, "one session per run");
-    assert_eq!(events_of(events, "test_module_end").len(), 1, "one module per package");
-    let session = events_of(events, "test_session_end")[0];
-    let module = events_of(events, "test_module_end")[0];
-    let (session_id, module_id) = (
-        &session["content"]["test_session_id"],
-        &module["content"]["test_module_id"],
-    );
+        assert_eq!(events_of(events, "test_session_end").len(), 1, "one session per run");
+        assert_eq!(events_of(events, "test_module_end").len(), 1, "one module per package");
+        let session = events_of(events, "test_session_end")[0];
+        let module = events_of(events, "test_module_end")[0];
+        let (session_id, module_id) = (
+            &session["content"]["test_session_id"],
+            &module["content"]["test_module_id"],
+        );
 
-    let tests = events_of(events, "test");
-    assert!(!tests.is_empty());
-    let mut suites: Vec<&str> = tests.iter().map(|test| meta(test, "test.suite")).collect();
-    suites.sort_unstable();
-    suites.dedup();
-    let ends: Vec<&Value> = events_of(events, "test_suite_end");
-    let mut ended: Vec<&str> = ends.iter().map(|end| meta(end, "test.suite")).collect();
-    ended.sort_unstable();
-    assert_eq!(ended, suites, "one suite end per suite");
+        let tests = events_of(events, "test");
+        assert!(!tests.is_empty());
+        let mut suites: Vec<&str> = tests.iter().map(|test| meta(test, "test.suite")).collect();
+        suites.sort_unstable();
+        suites.dedup();
+        let ends: Vec<&Value> = events_of(events, "test_suite_end");
+        let mut ended: Vec<&str> = ends.iter().map(|end| meta(end, "test.suite")).collect();
+        ended.sort_unstable();
+        assert_eq!(ended, suites, "one suite end per suite");
 
-    for event in tests.iter().chain(ends.iter()).chain([&session, &module]) {
-        assert_eq!(&event["content"]["test_session_id"], session_id);
-    }
-    for test in &tests {
-        assert_eq!(&test["content"]["test_module_id"], module_id);
-    }
-    for end in &ends {
-        let suite = meta(end, "test.suite");
-        for test in tests.iter().filter(|test| meta(test, "test.suite") == suite) {
-            assert_eq!(test["content"]["test_suite_id"], end["content"]["test_suite_id"]);
+        for event in tests.iter().chain(ends.iter()).chain([&session, &module]) {
+            assert_eq!(&event["content"]["test_session_id"], session_id);
+            assert_eq!(
+                meta(event, "test.working_directory"),
+                "fixtures/basic",
+                "the session fingerprint is the same on every event of the run"
+            );
         }
-    }
-
-    for end in &ends {
-        match meta(end, "test.suite") {
-            "basic::tests" => assert_eq!(meta(end, "test.status"), "pass", "the last attempt wins"),
-            "integration" => assert_eq!(meta(end, "test.status"), "fail"),
-            _ => {}
+        for test in &tests {
+            assert_eq!(&test["content"]["test_module_id"], module_id);
         }
+        for end in &ends {
+            let suite = meta(end, "test.suite");
+            for test in tests.iter().filter(|test| meta(test, "test.suite") == suite) {
+                assert_eq!(test["content"]["test_suite_id"], end["content"]["test_suite_id"]);
+            }
+        }
+
+        for end in &ends {
+            match meta(end, "test.suite") {
+                "basic::tests" => assert_eq!(meta(end, "test.status"), "pass", "the last attempt wins"),
+                "integration" => assert_eq!(meta(end, "test.status"), "fail"),
+                _ => {}
+            }
+        }
+        assert_eq!(meta(module, "test.status"), "fail");
+        assert_eq!(meta(session, "test.status"), "fail");
+        assert_eq!(meta(session, "test.module"), "basic-fixture");
+        assert!(
+            meta(session, "test.command").starts_with("cargo-nextest nextest run"),
+            "{}",
+            meta(session, "test.command")
+        );
+        assert_eq!(
+            tests_named(events, "basic::tests", "flaky_once").len(),
+            2,
+            "one event per attempt"
+        );
     }
-    assert_eq!(meta(module, "test.status"), "fail");
-    assert_eq!(meta(session, "test.status"), "fail");
-    assert_eq!(meta(session, "test.module"), "basic-fixture");
-    assert_eq!(meta(session, "test.working_directory"), "fixtures/basic");
-    assert!(
-        meta(session, "test.command").starts_with("cargo-nextest nextest run"),
-        "{}",
-        meta(session, "test.command")
-    );
-    assert_eq!(
-        tests_named(events, "basic::tests", "flaky_once").len(),
-        2,
-        "one event per attempt"
-    );
 
     let nextest_dir = run.read_cache.join("nextest");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -516,6 +522,27 @@ fn nextest_reports_one_session_for_the_run() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+
+    let recorded = run.recorded.lock().unwrap();
+    let events = &recorded.events;
+    assert_eq!(
+        events_of(events, "test_session_end").len(),
+        1,
+        "the finished finalizer sends no second session"
+    );
+    assert_eq!(events_of(events, "test_module_end").len(), 1);
+    let mut suites: Vec<&str> = events_of(events, "test")
+        .iter()
+        .map(|test| meta(test, "test.suite"))
+        .collect();
+    suites.sort_unstable();
+    suites.dedup();
+    let mut ended: Vec<&str> = events_of(events, "test_suite_end")
+        .iter()
+        .map(|end| meta(end, "test.suite"))
+        .collect();
+    ended.sort_unstable();
+    assert_eq!(ended, suites, "one suite end per suite, with no duplicate");
 }
 
 #[test]

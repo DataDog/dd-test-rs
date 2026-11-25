@@ -46,17 +46,15 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
         match Message::decode(&line) {
             Ok(Message::Test(record)) => session.record(record),
             Ok(Message::Finish(finish)) => {
-                let finalizer = session.finish(Some(finish));
+                session.finish(Some(finish));
                 detach_stderr();
                 reply(&mut output, Message::Finished);
                 session.close();
-                if let Some(finalizer) = finalizer {
-                    finalizer.run();
-                }
                 return 0;
             }
             Ok(Message::Cancel) => {
                 debug!("the test binary runs without Datadog, nothing is reported");
+                session.cancel();
                 detach_stderr();
                 session.close();
                 return 0;
@@ -66,11 +64,8 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
         }
     }
     detach_stderr();
-    let finalizer = session.finish(None);
+    session.finish(None);
     session.close();
-    if let Some(finalizer) = finalizer {
-        finalizer.run();
-    }
     0
 }
 

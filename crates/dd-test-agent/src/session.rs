@@ -71,6 +71,9 @@ pub struct AgentSession {
     command: String,
     session_name: String,
     working_directory: String,
+    repo_root: PathBuf,
+    /// The id the finalizer of a nextest run reuses, so its events match this process.
+    runtime_id: String,
     common: Tags,
     session_id: u64,
     module_id: u64,
@@ -80,6 +83,7 @@ pub struct AgentSession {
     suites: BTreeMap<String, SuiteState>,
     counts: Counts,
     run: Option<nextest::Member>,
+    finalizer: Option<nextest::Finalizer>,
 }
 
 impl AgentSession {
@@ -176,22 +180,20 @@ impl AgentSession {
         };
         bootstrap.repo_root = Some(repo_root.to_string_lossy().to_string());
 
-        let working_directory = working_dir
-            .strip_prefix(&repo_root)
-            .map(|p| p.to_string_lossy().to_string())
-            .ok()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| ".".to_string());
+        let working_directory = relative_directory(&repo_root, &working_dir);
         let session_name = session_name(config.session_name.as_deref(), &tags, &hello.command);
+        let runtime_id = format!("{:016x}{:016x}", new_id(), new_id());
         let metadata = Metadata {
-            runtime_id: format!("{:016x}{:016x}", new_id(), new_id()),
+            runtime_id: runtime_id.clone(),
             library_version: hello.library_version.clone(),
             env: env.clone(),
             session_name: session_name.clone(),
         };
         let uploader = Uploader::start({
             let telemetry = telemetry.clone();
-            move |spans| upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans)
+            move |spans| {
+                upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans);
+            }
         });
         let session = AgentSession {
             uploader,
@@ -206,6 +208,8 @@ impl AgentSession {
             command: hello.command.clone(),
             session_name,
             working_directory,
+            repo_root,
+            runtime_id,
             common,
             session_id: new_id(),
             module_id: new_id(),
@@ -215,6 +219,7 @@ impl AgentSession {
             suites: BTreeMap::new(),
             counts: Counts::default(),
             run: None,
+            finalizer: None,
         };
         (session, bootstrap)
     }
@@ -223,7 +228,7 @@ impl AgentSession {
     /// that the whole run is reported as one session. Runs after `Bootstrap`,
     /// before any test is reported.
     pub fn join_run(&mut self, hello: &Hello) {
-        let context = nextest::Context {
+        let context = || nextest::Context {
             service: self.service.clone(),
             env: self.env.clone(),
             library_version: hello.library_version.clone(),
@@ -235,9 +240,10 @@ impl AgentSession {
             test_management: self.test_management,
             common: self.common.clone(),
         };
-        let Some(run) = nextest::join(hello, &self.module, &self.working_directory, context) else {
+        let Some(run) = nextest::join(hello, &self.module, &self.repo_root, &self.runtime_id, context) else {
             return;
         };
+        self.working_directory = run.working_directory().to_string();
         self.session_id = run.session_id();
         self.module_id = run.module_id();
         self.run = Some(run);
@@ -301,10 +307,12 @@ impl AgentSession {
     }
 
     /// Reports suites, module and session, then sends everything. `None` means
-    /// the test binary exited without finishing, so the session fails. Returns
-    /// the finalizer of a `cargo nextest run` when this process has to report
-    /// the run: the caller finishes it after releasing the test binary.
-    pub fn finish(&mut self, finish: Option<Finish>) -> Option<nextest::Finalizer> {
+    /// the test binary exited without finishing, so the session fails. A
+    /// `cargo nextest run` reports the whole run instead, from `close`.
+    pub fn finish(&mut self, finish: Option<Finish>) {
+        // Before sending the test events, so the run does not include the time
+        // its uploads take.
+        let end = now_nanos();
         if let Some(run) = self.run.take() {
             self.uploader.close();
             let suites = std::mem::take(&mut self.suites)
@@ -317,9 +325,9 @@ impl AgentSession {
                 })
                 .collect();
             let faulty = finish.is_some_and(|f| f.efd_faulty);
-            return Some(run.finish(suites, finish.is_some(), faulty));
+            self.finalizer = Some(run.finish(end, suites, finish.is_some(), faulty));
+            return;
         }
-        let end = now_nanos();
         let complete = finish.is_some();
         let status = if complete { self.counts.status() } else { Status::Fail };
         let suites = std::mem::take(&mut self.suites);
@@ -369,14 +377,25 @@ impl AgentSession {
             t.count("test_session", &[provider.as_str()]);
         }
         self.uploader.close();
-        None
     }
 
-    /// Flushes telemetry. Runs after the test binary was told its results are
-    /// delivered, so a slow telemetry endpoint does not hold it up.
-    pub fn close(&self) {
+    /// Leaves a `cargo nextest run` without reporting this process, so the run
+    /// does not count it as an unfinished test.
+    pub fn cancel(&mut self) {
+        if let Some(run) = self.run.take() {
+            run.withdraw();
+        }
+    }
+
+    /// Flushes telemetry, then reports the run when this process has to. Runs
+    /// after the test binary was told its results are delivered, so a slow
+    /// telemetry endpoint or upload does not hold it up.
+    pub fn close(&mut self) {
         if let Some(t) = &self.telemetry {
             t.stop();
+        }
+        if let Some(finalizer) = self.finalizer.take() {
+            finalizer.run();
         }
     }
 
@@ -419,16 +438,25 @@ pub(crate) fn set_container_tags(span: &mut Span, early_flake_detection: bool, f
     }
 }
 
+/// The directory an event reports, relative to the root of the repository.
+pub(crate) fn relative_directory(repo_root: &Path, dir: &Path) -> String {
+    dir.strip_prefix(repo_root)
+        .map(|path| path.to_string_lossy().to_string())
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| ".".to_string())
+}
+
 pub(crate) fn upload(
     transport: Option<&Transport>,
     telemetry: Option<&Telemetry>,
     metadata: &Metadata,
     spans: &[Span],
-) {
-    let Some(transport) = transport else { return };
+) -> bool {
+    let Some(transport) = transport else { return false };
     if transport.is_unreachable(Intake::TestCycle) {
         debug!("dropped {} events, Datadog is unreachable", spans.len());
-        return;
+        return false;
     }
     let payload = encode_payload(metadata, spans);
     let started = Instant::now();
@@ -459,8 +487,14 @@ pub(crate) fn upload(
         }
     }
     match result {
-        Ok(_) => debug!("sent {} events ({} bytes)", spans.len(), payload.len()),
-        Err(error) => warn!("could not send test results to Datadog: {error}"),
+        Ok(_) => {
+            debug!("sent {} events ({} bytes)", spans.len(), payload.len());
+            true
+        }
+        Err(error) => {
+            warn!("could not send test results to Datadog: {error}");
+            false
+        }
     }
 }
 

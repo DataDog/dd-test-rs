@@ -15,12 +15,13 @@
 //! leaves the agent on the per-process path, so a run is never lost quietly.
 
 use crate::config::Config;
-use crate::event::{Kind, Metadata, Span};
+use crate::event::{encode_payload, Kind, Metadata, Span};
 use crate::ids::{new_id, now_nanos};
 use crate::read_cache;
 use crate::session::{self, Counts, INCOMPLETE_MESSAGE};
 use crate::telemetry::Telemetry;
 use crate::transport::Transport;
+use crate::uploader;
 use dd_test_core::protocol::{Hello, Status};
 use dd_test_core::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -41,24 +42,59 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const STALE_AFTER: Duration = Duration::from_secs(3600);
 const CLEANUP_MAX_ENTRIES: usize = 32;
 const CLEANUP_MAX_DURATION: Duration = Duration::from_millis(5);
-/// Wrapper scripts and target runners between the test binary and nextest.
-const MAX_ANCESTOR_DEPTH: usize = 4;
+/// The largest payload the intake accepts, uncompressed.
+const MAX_PAYLOAD: usize = 5_100_000;
 
 /// Joins the `cargo nextest run` this test binary is part of, or returns `None`
 /// when it is not one, or when the run cannot be shared.
-pub(crate) fn join(hello: &Hello, module: &str, working_directory: &str, context: Context) -> Option<Member> {
+pub(crate) fn join(
+    hello: &Hello,
+    module: &str,
+    repo_root: &Path,
+    runtime_id: &str,
+    context: impl FnOnce() -> Context,
+) -> Option<Member> {
     let run = RunEnv::from_env()?;
-    let Some(runner) = find_runner(hello.parent_pid) else {
-        debug!("nextest: no cargo-nextest among the parent processes");
+    let Some(runner) = nextest_parent(hello.parent_pid) else {
+        debug!("nextest: cargo-nextest did not start the test binary");
+        return None;
+    };
+    let Some(working_directory) = run_working_directory(repo_root) else {
+        debug!("nextest: NEXTEST_WORKSPACE_ROOT is not set, reporting one session per test process");
         return None;
     };
     let root = read_cache::default_dir().join(NEXTEST);
-    let member = Member::open(&root, run, Some(runner), module, working_directory, context)?;
+    let member = Member::open(
+        &root,
+        run,
+        Some(runner),
+        module,
+        &working_directory,
+        runtime_id,
+        context(),
+    )?;
     if member.lock.is_some() {
         // The finalizer outlives nextest, which kills the process group of a test when it times out.
         detach();
     }
     Some(member)
+}
+
+/// The working directory every event of the run reports, relative to the
+/// repository root. Tests of different packages run in different directories,
+/// and the events of one session must agree on this tag.
+fn run_working_directory(repo_root: &Path) -> Option<String> {
+    let workspace_root = std::env::var("NEXTEST_WORKSPACE_ROOT").ok();
+    workspace_directory(repo_root, workspace_root.as_deref())
+}
+
+fn workspace_directory(repo_root: &Path, workspace_root: Option<&str>) -> Option<String> {
+    let root = workspace_root.map(str::trim).filter(|root| !root.is_empty())?;
+    Some(session::relative_directory(repo_root, &canonical(Path::new(root))))
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// What nextest tells each test process about the run.
@@ -170,6 +206,7 @@ pub(crate) struct Member {
     lock: Option<File>,
     runner: Option<ProcessId>,
     context: Context,
+    runtime_id: String,
     binary_id: String,
     test_name: String,
     attempt: u32,
@@ -190,6 +227,7 @@ impl Member {
         runner: Option<ProcessId>,
         module: &str,
         working_directory: &str,
+        runtime_id: &str,
         context: Context,
     ) -> Option<Member> {
         let started = Instant::now();
@@ -220,6 +258,7 @@ impl Member {
             lock,
             runner,
             context,
+            runtime_id: runtime_id.to_string(),
             binary_id: run.binary_id,
             test_name: run.test_name,
             attempt: run.attempt,
@@ -250,6 +289,10 @@ impl Member {
         self.session_id
     }
 
+    pub(crate) fn working_directory(&self) -> &str {
+        &self.working_directory
+    }
+
     pub(crate) fn module_id(&self) -> u64 {
         self.module_id
     }
@@ -267,11 +310,12 @@ impl Member {
     }
 
     /// Writes the journal of this process, then hands the run to the finalizer
-    /// when this process holds the lock or can take it over.
-    pub(crate) fn finish(mut self, suites: Vec<SuiteEntry>, complete: bool, efd_faulty: bool) -> Finalizer {
+    /// when this process holds the lock or can take it over. `end` is taken
+    /// before the test events are sent, so the run does not include upload time.
+    pub(crate) fn finish(mut self, end: i64, suites: Vec<SuiteEntry>, complete: bool, efd_faulty: bool) -> Finalizer {
         let mut journal = self.journal();
         journal.state = State::Done;
-        journal.end = now_nanos();
+        journal.end = end;
         journal.complete = complete;
         journal.efd_faulty = efd_faulty;
         journal.suites = suites;
@@ -299,7 +343,18 @@ impl Member {
             dir: self.dir,
             runner: self.runner,
             lock: self.lock,
+            runtime_id: self.runtime_id,
+            context: self.context,
             limits: Limits::default(),
+        }
+    }
+
+    /// Leaves the run without reporting anything: the process exits before the
+    /// tests finish, so its journal must not count as incomplete. Dropping the
+    /// lock lets another process of the run report it.
+    pub(crate) fn withdraw(self) {
+        if let Err(error) = std::fs::remove_file(&self.marker) {
+            debug!("nextest: could not withdraw the marker: {error}");
         }
     }
 
@@ -328,13 +383,17 @@ impl Member {
 }
 
 /// Reports the whole run: suites, modules and the session, once nextest exited.
-pub struct Finalizer {
+pub(crate) struct Finalizer {
     root: PathBuf,
     run_id: String,
     dir: PathBuf,
     runner: Option<ProcessId>,
     /// The run's lock when this process took it at the start of the run.
     lock: Option<File>,
+    /// The runtime id of this process, so its container events match its tests.
+    runtime_id: String,
+    /// The context of this process, used when `context.json` is missing.
+    context: Context,
     limits: Limits,
 }
 
@@ -342,13 +401,14 @@ impl Finalizer {
     pub(crate) fn run(mut self) {
         let lock = match self.lock.take() {
             Some(lock) => lock,
-            None => {
-                let Some(lock) = self.take_over() else {
-                    return;
-                };
-                detach();
-                lock
-            }
+            None => match self.take_over() {
+                Some(lock) => {
+                    detach();
+                    lock
+                }
+                // Another process reported the run, or it is gone.
+                None => return,
+            },
         };
         let log = self.open_log();
         escape(log.as_ref());
@@ -356,11 +416,10 @@ impl Finalizer {
         let journals = gather(&self.dir, self.runner, &self.limits);
         if journals.is_empty() {
             debug!("nextest: no journals, nothing to report");
-        } else if let Some(context) = read_context(&self.dir) {
+        } else {
+            let context = read_context(&self.dir).unwrap_or_else(|| self.context.clone());
             let folded = fold(&journals);
             self.send(&context, &folded);
-        } else {
-            debug!("nextest: no context, the run is not reported");
         }
         let _ = std::fs::remove_dir_all(&self.dir);
         drop(lock);
@@ -368,9 +427,10 @@ impl Finalizer {
     }
 
     /// The lock of a run whose finalizer is gone: the operating system releases
-    /// a flock when its holder dies.
+    /// a flock when its holder dies. A run whose directory is removed is over,
+    /// so this never brings the lock file back.
     fn take_over(&self) -> Option<File> {
-        read_cache::takeover_guard(&self.dir.join(LOCK)).ok().flatten()
+        read_cache::existing_guard(&self.dir.join(LOCK)).ok().flatten()
     }
 
     fn open_log(&self) -> Option<File> {
@@ -421,13 +481,18 @@ impl Finalizer {
             }
         };
         let metadata = Metadata {
-            runtime_id: format!("{:016x}{:016x}", new_id(), new_id()),
+            runtime_id: self.runtime_id.clone(),
             library_version: context.library_version.clone(),
             env: context.env.clone(),
             session_name: context.session_name.clone(),
         };
-        session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, &spans);
-        debug!("nextest: sent {} container events", spans.len());
+        let mut sent = 0;
+        for batch in batches(&metadata, &spans) {
+            if session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, batch) {
+                sent += batch.len();
+            }
+        }
+        debug!("nextest: sent {sent} of {} container events", spans.len());
         if let Some(telemetry) = &telemetry {
             telemetry.stop();
         }
@@ -453,11 +518,12 @@ impl Default for Limits {
 }
 
 /// Waits for nextest to exit, then for the test processes that are still
-/// writing, and reads every journal of the run.
+/// writing, and reads every journal of the run once.
 fn gather(dir: &Path, runner: Option<ProcessId>, limits: &Limits) -> Vec<Journal> {
     wait_for_runner(runner, limits);
-    drain(dir, limits);
-    read_journals(dir)
+    let journals = read_journals(dir);
+    drain(&journals, limits);
+    journals
 }
 
 fn wait_for_runner(runner: Option<ProcessId>, limits: &Limits) {
@@ -481,34 +547,40 @@ fn wait_for_runner(runner: Option<ProcessId>, limits: &Limits) {
 
 /// Waits for the test processes of the run that are still running. A process
 /// that is gone or that runs out the timeout counts as incomplete.
-fn drain(dir: &Path, limits: &Limits) {
+fn drain(journals: &[Journal], limits: &Limits) {
+    let mut running: Vec<&Journal> = journals.iter().filter(|journal| writing(journal)).collect();
+    if running.is_empty() {
+        return;
+    }
     let started = Instant::now();
     loop {
-        let running = live_markers(dir);
-        if running == 0 {
-            break;
+        running.retain(|journal| alive(journal));
+        if running.is_empty() {
+            debug!("nextest: every test process finished");
+            return;
         }
         if started.elapsed() >= limits.drain {
             warn!(
-                "nextest: {running} test processes still running after {:?}, they count as incomplete",
+                "nextest: {} test processes still running after {:?}, they count as incomplete",
+                running.len(),
                 limits.drain
             );
-            break;
+            return;
         }
         std::thread::sleep(limits.poll);
     }
-    debug!("nextest: drained {} journals", read_journals(dir).len());
 }
 
-/// Markers of processes that still run, other than this one: the finalizer's own
-/// marker stays running when its journal could not be written.
-fn live_markers(dir: &Path) -> usize {
-    read_journals(dir)
-        .iter()
-        .filter(|journal| journal.state == State::Running)
-        .filter(|journal| journal.pid != std::process::id())
-        .filter(|journal| ProcessId::new(journal.pid, journal.pstart).is_some_and(|id| id.alive()))
-        .count()
+/// A marker of another process that has not written its journal yet: the
+/// finalizer's own marker stays running when its journal could not be written.
+fn writing(journal: &Journal) -> bool {
+    journal.state == State::Running && journal.pid != std::process::id()
+}
+
+/// A marker without a start time counts as alive, so a process that could not
+/// read its own start time still gets `DRAIN_TIMEOUT` to write its journal.
+fn alive(journal: &Journal) -> bool {
+    journal.pstart == 0 || ProcessId::new(journal.pid, journal.pstart).is_some_and(|id| id.alive())
 }
 
 fn read_journals(dir: &Path) -> Vec<Journal> {
@@ -607,13 +679,56 @@ fn cleanup_stale_within(root: &Path, max_duration: Duration) {
         }
         let path = entry.path();
         if path.is_dir() {
-            if matches!(read_cache::takeover_guard(&path.join(LOCK)), Ok(Some(_))) {
-                let _ = std::fs::remove_dir_all(&path);
+            // The guard stays held until the directory is gone, so no agent
+            // joins a run that is being removed.
+            match read_cache::takeover_guard(&path.join(LOCK)) {
+                Ok(Some(_guard)) if !keeps_writing(&path) => {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                _ => {}
             }
         } else if path.extension().is_some_and(|extension| extension == "log") {
-            let _ = std::fs::remove_file(&path);
+            // The log of a run that is still there belongs to its finalizer.
+            let run = path.file_stem().map(|name| root.join(name)).unwrap_or_default();
+            if !run.exists() {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
+}
+
+/// Whether a test process of the run is still writing its journal.
+fn keeps_writing(dir: &Path) -> bool {
+    read_journals(dir)
+        .iter()
+        .any(|journal| writing(journal) && alive(journal))
+}
+
+/// Splits the container events of a run into payloads the intake accepts: the
+/// uploader's batch size, and no more than the uncompressed payload limit.
+fn batches<'a>(metadata: &Metadata, spans: &'a [Span]) -> Vec<&'a [Span]> {
+    batches_within(metadata, spans, MAX_PAYLOAD)
+}
+
+fn batches_within<'a>(metadata: &Metadata, spans: &'a [Span], max_payload: usize) -> Vec<&'a [Span]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, span) in spans.iter().enumerate() {
+        // A payload of one event carries the whole payload overhead, so the sum
+        // over-counts and no batch goes over the limit.
+        let size = encode_payload(metadata, std::slice::from_ref(span)).len();
+        if index > start && (index - start == uploader::FLUSH_EVENTS || bytes + size > max_payload) {
+            batches.push(&spans[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < spans.len() {
+        batches.push(&spans[start..]);
+    }
+    batches
 }
 
 struct Folded {
@@ -869,41 +984,44 @@ impl ProcessId {
 }
 
 struct ProcessInfo {
-    parent: u32,
     name: String,
     start: u64,
 }
 
-/// The parent process of the test binary, such as nextest or a wrapper of it.
-fn find_runner(parent: Option<u32>) -> Option<ProcessId> {
-    let mut pid = parent?;
-    for _ in 0..MAX_ANCESTOR_DEPTH {
-        let info = process_info(pid)?;
-        if info.name == "cargo-nextest" {
-            return ProcessId::new(pid, info.start);
-        }
-        if info.parent == 0 || info.parent == pid {
-            return None;
-        }
-        pid = info.parent;
+/// Whether nextest started the test binary. A test that runs `cargo test`
+/// inherits the `NEXTEST_*` variables of the outer run, but cargo starts its
+/// binary, so it does not join the outer run.
+fn nextest_parent(parent: Option<u32>) -> Option<ProcessId> {
+    let pid = parent?;
+    let info = process_info(pid)?;
+    if info.name != "cargo-nextest" {
+        return None;
     }
-    None
+    ProcessId::new(pid, info.start)
 }
 
 #[cfg(target_os = "linux")]
 fn process_info(pid: u32) -> Option<ProcessInfo> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let tail = &stat[stat.rfind(')')? + 1..];
-    let mut fields = tail.split_whitespace();
-    fields.next()?;
-    let parent = fields.next()?.parse().ok()?;
-    let start = fields.nth(17)?.parse().ok()?;
+    let start = stat_start(&stat)?;
     let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
     Some(ProcessInfo {
-        parent,
         name: name.trim().to_string(),
         start,
     })
+}
+
+/// The start time of the process in a `/proc/<pid>/stat` line, or `None` when
+/// the process exited.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_start(stat: &str) -> Option<u64> {
+    // The command can hold spaces and parentheses, so the fields start after
+    // the last one. A zombie has exited, though its entry is still there.
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    if matches!(fields.next()?, "Z" | "X") {
+        return None;
+    }
+    fields.nth(18)?.parse().ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -931,7 +1049,6 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
         .map(char::from)
         .collect();
     Some(ProcessInfo {
-        parent: info.pbi_ppid,
         name,
         start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
     })
@@ -1031,6 +1148,7 @@ mod tests {
             None,
             "fixture",
             "fixtures/basic",
+            "0123456789abcdef",
             context(),
         )
     }
@@ -1072,10 +1190,10 @@ mod tests {
 
     fn status_of(folded: &Folded, module: Option<&str>, suite: Option<&str>) -> Status {
         match (module, suite) {
-            (Some(module), Some(suite)) => folded
+            (module, Some(suite)) => folded
                 .suites
                 .iter()
-                .find(|folded| folded.module == module && folded.name == suite)
+                .find(|folded| folded.name == suite && module.is_none_or(|module| folded.module == module))
                 .unwrap()
                 .counts
                 .status(),
@@ -1086,7 +1204,7 @@ mod tests {
                     .find(|folded| folded.module.as_deref() == Some(module))
                     .unwrap(),
             ),
-            _ => container_status(&folded.session),
+            (None, None) => container_status(&folded.session),
         }
     }
 
@@ -1249,11 +1367,63 @@ mod tests {
         assert!(first.lock.is_some(), "the first agent finalizes");
         assert!(second.lock.is_none(), "the second agent only reports its own tests");
 
-        let elected = first.finish(Vec::new(), true, false);
-        let member = second.finish(Vec::new(), true, false);
+        let elected = first.finish(1, Vec::new(), true, false);
+        let member = second.finish(2, Vec::new(), true, false);
         assert!(member.lock.is_none());
         drop(elected);
         eventually(|| member.take_over());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_agent_withdraws_its_marker_and_lets_another_process_report() {
+        let dir = temp_dir("cancel");
+        let elected = join_in(&dir).unwrap();
+        let member = join_in(&dir).unwrap();
+        let marker = elected.marker.clone();
+        let dir_path = elected.dir.clone();
+        elected.withdraw();
+        assert!(!marker.exists(), "a process that reports nothing leaves no marker");
+
+        let finalizer = member.finish(2, Vec::new(), true, false);
+        eventually(|| finalizer.take_over());
+        let journals = read_journals(&dir_path);
+        assert_eq!(journals.len(), 1, "only the process that reported counts");
+        assert!(!fold(&journals).session.incomplete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_member_that_takes_over_after_the_run_ended_does_not_finalize() {
+        let dir = temp_dir("ended");
+        let elected = join_in(&dir).unwrap();
+        let member = join_in(&dir).unwrap();
+        let dir_path = elected.dir.clone();
+        drop(elected.lock);
+        std::fs::remove_dir_all(&dir_path).unwrap();
+
+        let finalizer = member.finish(2, Vec::new(), true, false);
+        assert!(finalizer.take_over().is_none(), "the run is over");
+        assert!(!dir_path.exists(), "the directory does not come back");
+        assert!(!dir_path.join(LOCK).exists(), "the lock file does not come back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_journal_keeps_the_end_time_it_is_given() {
+        let dir = temp_dir("end");
+        let member = join_in(&dir).unwrap();
+        let dir_path = member.dir.clone();
+        let marker = member.marker.clone();
+        let finalizer = member.finish(42, Vec::new(), true, true);
+        let journal = read_journals(&dir_path)
+            .into_iter()
+            .find(|journal| journal.end == 42)
+            .expect("the journal ends when the process was told to, before its uploads");
+        assert_eq!(journal.state, State::Done);
+        assert!(journal.complete && journal.efd_faulty);
+        assert!(marker.exists());
+        drop(finalizer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1288,11 +1458,14 @@ mod tests {
     fn waits_for_the_runner_to_exit() {
         let dir = temp_dir("waits");
         let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 0.3"]));
+        // Reaped while waiting, or Linux keeps it a zombie with the same start
+        // time and the wait never ends.
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
         let started = Instant::now();
         let journals = gather(&dir, id, &limits(Duration::from_secs(10), Duration::from_millis(100)));
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(5));
-        child.wait().unwrap();
+        reaper.join().unwrap();
         assert!(journals.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1325,8 +1498,9 @@ mod tests {
         marker.pid = id.unwrap().pid;
         marker.pstart = id.unwrap().start;
         write_json(&dir_path.join("j-live.json"), &marker).unwrap();
+        let journals = read_journals(&dir_path);
         let started = Instant::now();
-        drain(&dir_path, &limits(Duration::from_secs(10), Duration::from_secs(10)));
+        drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
         assert!(started.elapsed() >= Duration::from_millis(300));
         child.wait().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1347,8 +1521,9 @@ mod tests {
         live.pstart = id.unwrap().start;
         write_json(&dir_path.join("j-live.json"), &live).unwrap();
 
+        let journals = read_journals(&dir_path);
         let started = Instant::now();
-        drain(&dir_path, &limits(Duration::from_secs(10), Duration::from_millis(200)));
+        drain(&journals, &limits(Duration::from_secs(10), Duration::from_millis(200)));
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(3));
         child.kill().unwrap();
@@ -1361,36 +1536,94 @@ mod tests {
     }
 
     #[test]
-    fn removes_only_stale_directories_whose_lock_is_free() {
+    fn a_marker_without_a_start_time_counts_as_alive() {
+        let dir = temp_dir("unknown-start");
+        let member = join_in(&dir).unwrap();
+        let mut marker = member.journal();
+        marker.pid = 1;
+        marker.pstart = 0;
+        let started = Instant::now();
+        drain(&[marker], &limits(Duration::from_secs(10), Duration::from_millis(200)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the drain timeout bounds it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drains_without_reading_the_journals_again() {
+        let dir = temp_dir("parse-once");
+        let member = join_in(&dir).unwrap();
+        let dir_path = member.dir.clone();
+        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 0.3"]));
+        let mut marker = member.journal();
+        marker.pid = id.unwrap().pid;
+        marker.pstart = id.unwrap().start;
+        write_json(&dir_path.join("j-live.json"), &marker).unwrap();
+        let journals = read_journals(&dir_path);
+        std::fs::remove_dir_all(&dir_path).unwrap();
+
+        let started = Instant::now();
+        drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "the process that was running decides, not a second read of the directory"
+        );
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removes_only_stale_directories_that_are_done() {
         let root = temp_dir("cleanup");
         let old = std::time::SystemTime::now() - STALE_AFTER * 2;
         let stale = root.join("stale");
         let held = root.join("held");
+        let writing = root.join("writing");
         let fresh = root.join("fresh");
-        for dir in [&stale, &held, &fresh] {
+        for dir in [&stale, &held, &writing, &fresh] {
             std::fs::create_dir_all(dir).unwrap();
         }
         let _guard = read_cache::takeover_guard(&held.join(LOCK)).unwrap().unwrap();
-        for dir in [&stale, &held] {
+        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 5"]));
+        let done = journal("fixture", "integration", "a", Some(Status::Pass));
+        write_json(&stale.join("j-done.json"), &done).unwrap();
+        let mut running = journal("fixture", "integration", "b", None);
+        running.state = State::Running;
+        running.pid = id.unwrap().pid;
+        running.pstart = id.unwrap().start;
+        write_json(&writing.join("j-live.json"), &running).unwrap();
+        for dir in [&stale, &held, &writing] {
             File::open(dir)
                 .unwrap()
                 .set_times(std::fs::FileTimes::new().set_modified(old))
                 .unwrap();
         }
-        let log = root.join("run.log");
-        File::create(&log)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(old))
-            .unwrap();
+        let log = |name: &str| {
+            let path = root.join(name);
+            File::create(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            path
+        };
+        // The log of a run whose directory is still there belongs to its finalizer.
+        let kept_log = log("writing.log");
+        let removed_log = log("gone.log");
         let recent = root.join("recent.log");
         File::create(&recent).unwrap();
 
         cleanup_stale_within(&root, Duration::MAX);
         assert!(!stale.exists(), "an old directory with a free lock goes away");
         assert!(held.exists(), "a held lock keeps its directory");
+        assert!(writing.exists(), "a process that still writes keeps its directory");
         assert!(fresh.exists());
-        assert!(!log.exists());
+        assert!(kept_log.exists());
+        assert!(!removed_log.exists());
         assert!(recent.exists());
+        child.kill().unwrap();
+        child.wait().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1446,5 +1679,95 @@ mod tests {
         assert!(ProcessId::new(std::process::id(), me.start).unwrap().alive());
         assert!(!ProcessId::new(std::process::id(), me.start + 1).unwrap().alive());
         assert!(!ProcessId::new(0, 0).is_some_and(|id| id.alive()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_counts_as_exited() {
+        let mut child = Command::new("sh").args(["-c", "sleep 0.2"]).spawn().unwrap();
+        let start = process_info(child.id()).unwrap().start;
+        let state = |pid: u32| -> String {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            stat.rsplit_once(')')
+                .map_or(String::new(), |(_, tail)| tail.to_string())
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !state(child.id()).trim_start().starts_with('Z') {
+            assert!(Instant::now() < deadline, "the child becomes a zombie");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !ProcessId::new(child.id(), start).unwrap().alive(),
+            "a zombie still has its start time, but it has exited"
+        );
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn reads_the_start_time_after_a_command_with_spaces_and_parentheses() {
+        let stat = "1234 (a command (with) spaces) S 1 1234 1234 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(stat_start(stat), Some(987_654));
+        let zombie = "1234 (a command) Z 1 1234 1234 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(stat_start(zombie), None, "a zombie has exited");
+        assert_eq!(stat_start("not a stat line"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_parent_that_is_nextest_joins_the_run() {
+        assert!(nextest_parent(None).is_none());
+        assert!(nextest_parent(Some(0)).is_none());
+        assert!(
+            nextest_parent(Some(std::process::id())).is_none(),
+            "the test binary of a nested cargo test does not join the outer run"
+        );
+    }
+
+    #[test]
+    fn a_run_reports_its_workspace_root_as_the_working_directory() {
+        let repo = temp_dir("workspace");
+        let packages = repo.join("packages");
+        std::fs::create_dir_all(packages.join("one")).unwrap();
+        std::fs::create_dir_all(packages.join("two")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+        let workspace = |path: &Path| workspace_directory(&repo, Some(path.to_str().unwrap()));
+
+        // The workspace root, not the directory of the package that runs a
+        // test, so every package of the run reports the same directory.
+        assert_eq!(workspace(&repo).as_deref(), Some("."));
+        assert_eq!(workspace(&packages).as_deref(), Some("packages"));
+        assert_eq!(workspace_directory(&repo, None), None);
+        assert_eq!(workspace_directory(&repo, Some("   ")), None);
+        assert_eq!(workspace_directory(&repo, Some("/")).as_deref(), Some("."));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn sends_the_container_events_in_batches_the_intake_accepts() {
+        let metadata = Metadata {
+            runtime_id: "0123456789abcdef".to_string(),
+            library_version: "0.2.0".to_string(),
+            env: "ci".to_string(),
+            session_name: "unit".to_string(),
+        };
+        let span = |name: String| {
+            let mut span = Span::new(Kind::Suite, "libtest.test_suite", &name, "svc", 0);
+            span.set("filler", "x".repeat(1000));
+            span
+        };
+        let spans: Vec<Span> = (0..uploader::FLUSH_EVENTS + 3).map(|i| span(format!("s{i}"))).collect();
+
+        let batches = batches(&metadata, &spans);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), uploader::FLUSH_EVENTS);
+        assert_eq!(batches[1].len(), 3);
+
+        let limit = 50_000;
+        let small = batches_within(&metadata, &spans, limit);
+        assert!(small.len() > 2, "the payload limit splits the run further");
+        assert!(small
+            .iter()
+            .all(|batch| encode_payload(&metadata, batch).len() <= limit));
+        assert_eq!(small.iter().map(|batch| batch.len()).sum::<usize>(), spans.len());
     }
 }
