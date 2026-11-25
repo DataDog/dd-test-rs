@@ -574,6 +574,8 @@ struct Limits {
     runner_wait: Duration,
     drain: Duration,
     poll: Duration,
+    /// The handle that reports the exit of the runner, `None` to poll for it.
+    watch: fn(u32) -> Option<exit_event::ExitEvent>,
 }
 
 impl Default for Limits {
@@ -582,6 +584,7 @@ impl Default for Limits {
             runner_wait: RUNNER_WAIT_TIMEOUT,
             drain: DRAIN_TIMEOUT,
             poll: POLL_INTERVAL,
+            watch: exit_event::watch,
         }
     }
 }
@@ -589,7 +592,9 @@ impl Default for Limits {
 /// Waits for nextest to exit, then for the processes that are still writing
 /// their journal, and collects the journals of the run once they stopped.
 fn gather(dir: &Path, runner: Option<ProcessId>, limits: &Limits) -> Vec<Journal> {
-    wait_for_runner(runner, limits);
+    if let Some(runner) = runner {
+        wait_for_runner(runner, limits);
+    }
     let mut entries = read_entries(dir);
     let running: Vec<Journal> = entries
         .iter()
@@ -627,22 +632,160 @@ fn reread(entries: &mut Vec<(PathBuf, Journal)>) {
     });
 }
 
-fn wait_for_runner(runner: Option<ProcessId>, limits: &Limits) {
-    let Some(runner) = runner else { return };
+/// Waits for nextest to exit and reports how the finalizer learned it, so the
+/// debug log and the tests can tell an exit event from a poll.
+fn wait_for_runner(runner: ProcessId, limits: &Limits) -> &'static str {
     let started = Instant::now();
-    loop {
-        if !runner.alive() {
-            debug!("nextest: runner exited after {} us", started.elapsed().as_micros());
-            return;
-        }
-        if started.elapsed() >= limits.runner_wait {
+    let event = (limits.watch)(runner.pid);
+    let via = match &event {
+        Some(_) => exit_event::VIA,
+        None => "poll",
+    };
+    // The identity is checked once the handle exists: a pid that exits and is
+    // reused in between would otherwise be watched in place of the runner.
+    let mut exited = !runner.alive();
+    while !exited {
+        let left = limits.runner_wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
             debug!(
                 "nextest: runner still running after {:?}, reporting what there is",
                 limits.runner_wait
             );
-            return;
+            return via;
         }
-        std::thread::sleep(limits.poll);
+        let reported = match &event {
+            Some(event) => event.wait(left),
+            None => {
+                std::thread::sleep(limits.poll);
+                false
+            }
+        };
+        exited = reported || !runner.alive();
+    }
+    debug!(
+        "nextest: runner exited after {} us via:{via}",
+        started.elapsed().as_micros()
+    );
+    via
+}
+
+/// The exit of a process, reported by the kernel instead of polled, so the
+/// finalizer can send the run as soon as nextest is gone.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod exit_event {
+    use std::io::{Error, Result};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    pub(super) const VIA: &str = "pidfd";
+    #[cfg(target_os = "macos")]
+    pub(super) const VIA: &str = "kqueue";
+
+    pub(super) struct ExitEvent {
+        fd: OwnedFd,
+    }
+
+    /// The handle that reports the exit of `pid`, or `None` when the kernel
+    /// does not report it, so the caller polls instead.
+    pub(super) fn watch(pid: u32) -> Option<ExitEvent> {
+        ExitEvent::new(pid).ok()
+    }
+
+    impl ExitEvent {
+        #[cfg(target_os = "linux")]
+        fn new(pid: u32) -> Result<ExitEvent> {
+            let pid = libc::pid_t::try_from(pid).map_err(|_| Error::from(std::io::ErrorKind::InvalidInput))?;
+            // SAFETY: pidfd_open takes a pid and a flags word, both `c_long`,
+            // and returns a new descriptor, or -1 with the error in errno.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: the descriptor was just created and this process owns it.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+            Ok(ExitEvent { fd })
+        }
+
+        #[cfg(target_os = "macos")]
+        fn new(pid: u32) -> Result<ExitEvent> {
+            // SAFETY: kqueue takes no arguments and returns a new descriptor.
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: the descriptor was just created and this process owns it.
+            let fd = unsafe { OwnedFd::from_raw_fd(kq) };
+            let change = libc::kevent {
+                ident: pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: the change is one initialized event that kevent reads and
+            // does not keep, and the call reads no output buffer.
+            let added = unsafe { libc::kevent(fd.as_raw_fd(), &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            if added < 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(ExitEvent { fd })
+        }
+
+        /// Whether the process exited within `timeout`.
+        #[cfg(target_os = "linux")]
+        pub(super) fn wait(&self, timeout: Duration) -> bool {
+            let mut fd = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: poll reads one initialized pollfd that outlives the call.
+            unsafe { libc::poll(&mut fd, 1, ms) > 0 }
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(super) fn wait(&self, timeout: Duration) -> bool {
+            let timeout = libc::timespec {
+                tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+            };
+            let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
+            // SAFETY: kevent writes at most one event into the buffer that
+            // outlives the call, and keeps neither pointer.
+            let ready = unsafe {
+                libc::kevent(
+                    self.fd.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    event.as_mut_ptr(),
+                    1,
+                    &timeout,
+                )
+            };
+            ready > 0
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod exit_event {
+    use std::time::Duration;
+
+    pub(super) const VIA: &str = "poll";
+
+    pub(super) struct ExitEvent;
+
+    pub(super) fn watch(_pid: u32) -> Option<ExitEvent> {
+        None
+    }
+
+    impl ExitEvent {
+        pub(super) fn wait(&self, _timeout: Duration) -> bool {
+            false
+        }
     }
 }
 
@@ -1948,6 +2091,7 @@ mod tests {
             runner_wait,
             drain,
             poll: Duration::from_millis(10),
+            watch: exit_event::watch,
         }
     }
 
@@ -1974,6 +2118,59 @@ mod tests {
         assert!(gathered.recv_timeout(Duration::from_secs(30)).unwrap().is_empty());
         reaper.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asserts that waiting for a runner through `watch` ends with `via` once
+    /// the runner exits.
+    fn ends_the_wait_with(watch: fn(u32) -> Option<exit_event::ExitEvent>, via: &str) {
+        let (mut child, id, stdin) = blocking_runner();
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        let mut limits = limits(Duration::from_secs(10), Duration::from_millis(100));
+        limits.watch = watch;
+        let waited = waiting(move || wait_for_runner(id.unwrap(), &limits));
+        assert!(
+            waited.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the runner is still running"
+        );
+        drop(stdin);
+        assert_eq!(waited.recv_timeout(Duration::from_secs(30)).unwrap(), via);
+        reaper.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pidfd_ends_the_wait_when_the_runner_exits() {
+        ends_the_wait_with(exit_event::watch, "pidfd");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_kqueue_event_ends_the_wait_when_the_runner_exits() {
+        ends_the_wait_with(exit_event::watch, "kqueue");
+    }
+
+    #[test]
+    fn polls_when_the_kernel_cannot_report_the_exit() {
+        ends_the_wait_with(|_| None, "poll");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_exit_event_wait_ends_at_the_deadline() {
+        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 5"]));
+        let started = Instant::now();
+        let via = wait_for_runner(
+            id.unwrap(),
+            &limits(Duration::from_millis(200), Duration::from_millis(100)),
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the deadline bounds the wait"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(via, exit_event::VIA, "the wait used the exit event");
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
