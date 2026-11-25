@@ -385,6 +385,8 @@ impl Member {
             lock: self.lock,
             runtime_id: self.runtime_id,
             context: self.context,
+            start: self.start,
+            working_directory: self.working_directory,
             limits: Limits::default(),
         }
     }
@@ -425,6 +427,8 @@ pub(crate) struct Finalizer {
     runtime_id: String,
     /// The context of this process, used when `context.json` is missing.
     context: Context,
+    start: i64,
+    working_directory: String,
     limits: Limits,
 }
 
@@ -449,7 +453,7 @@ impl Finalizer {
             debug!("nextest: no journals, nothing to report");
         } else {
             let context = read_context(&self.dir).unwrap_or_else(|| self.context.clone());
-            let folded = fold(&journals);
+            let folded = fold(&journals, self.own());
             self.send(&context, &folded);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -479,6 +483,15 @@ impl Finalizer {
                 debug!("nextest: no debug log: {error}");
                 None
             }
+        }
+    }
+
+    /// What this process knows about the run when no journal can tell it: the
+    /// session it started with.
+    fn own(&self) -> OwnSession<'_> {
+        OwnSession {
+            start: self.start,
+            working_directory: &self.working_directory,
         }
     }
 
@@ -576,10 +589,13 @@ fn reread(entries: &mut Vec<(PathBuf, Journal)>) {
             return true;
         }
         match read_journal(path) {
-            Ok(Some(latest)) => {
+            Ok(Some(latest)) if !unreadable(&latest) => {
                 *journal = latest;
                 true
             }
+            // A marker that stops reading keeps what the snapshot knew, as an
+            // error does: its module, its attempt and its identity still count.
+            Ok(Some(_)) => true,
             Ok(None) => false,
             Err(error) => {
                 debug!("nextest: could not read {} again: {error}", path.display());
@@ -737,6 +753,12 @@ fn unreadable_journal() -> Journal {
     }
 }
 
+/// A journal whose process reported nothing readable: it names no module, so
+/// only its incompleteness counts.
+fn unreadable(journal: &Journal) -> bool {
+    journal.module.is_empty()
+}
+
 fn read_context(dir: &Path) -> Option<Context> {
     match std::fs::read(dir.join(CONTEXT)) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -886,9 +908,16 @@ struct FoldedContainer {
     test_management: bool,
 }
 
+/// The session of the process that finalizes the run, for when no journal can
+/// say when the run started or where it ran.
+struct OwnSession<'a> {
+    start: i64,
+    working_directory: &'a str,
+}
+
 /// Only the last attempt of each test counts, since nextest runs a retry in a
 /// new process.
-fn fold(journals: &[Journal]) -> Folded {
+fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
     let mut kept: BTreeMap<(&str, &str, Option<u64>), &Journal> = BTreeMap::new();
     for journal in journals {
         let key = (journal.binary_id.as_str(), journal.test_name.as_str(), journal.stress);
@@ -914,7 +943,7 @@ fn fold(journals: &[Journal]) -> Folded {
     let mut suites: BTreeMap<(&str, &str), FoldedSuite> = BTreeMap::new();
     // A journal the finalizer could not read names no module and no time: its
     // process still fails the session.
-    session.incomplete |= journals.iter().any(|journal| journal.module.is_empty());
+    session.incomplete |= journals.iter().any(unreadable);
     for journal in journals.iter().filter(|journal| !journal.module.is_empty()) {
         let (start, end) = range.unwrap_or((journal.start, journal.end));
         range = Some((start.min(journal.start), end.max(journal.end)));
@@ -1012,8 +1041,14 @@ fn fold(journals: &[Journal]) -> Folded {
         .first()
         .copied()
         .filter(|first| directories.iter().all(|directory| directory == first));
-    session.working_directory = shared.unwrap_or(".").to_string();
-    (session.start, session.end) = range.unwrap_or((0, 0));
+    // A run whose journals all failed to read still has the session of this
+    // process, which knows when it started and where nextest ran it.
+    (session.start, session.end) = range.unwrap_or((own.start, own.start));
+    session.working_directory = match shared {
+        Some(directory) => directory.to_string(),
+        None if directories.is_empty() => own.working_directory.to_string(),
+        None => ".".to_string(),
+    };
     Folded {
         suites: suites.into_values().collect(),
         modules: modules.into_values().collect(),
@@ -1320,6 +1355,18 @@ mod tests {
         )
     }
 
+    /// The session of the finalizer of the tests that call `join_in`.
+    fn own() -> OwnSession<'static> {
+        OwnSession {
+            start: 5,
+            working_directory: "fixtures/basic",
+        }
+    }
+
+    fn fold_run(journals: &[Journal]) -> Folded {
+        fold(journals, own())
+    }
+
     fn journal(module: &str, suite: &str, test: &str, status: Option<Status>) -> Journal {
         Journal {
             v: JOURNAL_VERSION,
@@ -1393,7 +1440,7 @@ mod tests {
         failed.attempt = 1;
         let mut passed = journal("fixture", "integration", "flaky", Some(Status::Pass));
         passed.attempt = 2;
-        let folded = fold(&[failed, passed]);
+        let folded = fold_run(&[failed, passed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
         assert_eq!(status_of(&folded, None, None), Status::Pass);
         assert!(!folded.session.incomplete);
@@ -1405,7 +1452,7 @@ mod tests {
         killed.attempt = 1;
         let mut passed = journal("fixture", "integration", "a", Some(Status::Pass));
         passed.attempt = 2;
-        let folded = fold(&[killed, passed]);
+        let folded = fold_run(&[killed, passed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
         assert!(!folded.session.incomplete);
     }
@@ -1418,7 +1465,7 @@ mod tests {
         killed.attempt = 2;
         killed.suites.clear();
 
-        let folded = fold(&[failed, killed]);
+        let folded = fold_run(&[failed, killed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
         assert!(folded.session.incomplete);
     }
@@ -1431,7 +1478,7 @@ mod tests {
         killed.attempt = 2;
         killed.suites.clear();
 
-        let folded = fold(&[passed, killed]);
+        let folded = fold_run(&[passed, killed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
         assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
         assert_eq!(status_of(&folded, None, None), Status::Fail);
@@ -1443,7 +1490,7 @@ mod tests {
         killed.start = 5;
         let mut passed = journal("fixture", "basic::tests", "passes", Some(Status::Pass));
         passed.module = "other".to_string();
-        let folded = fold(&[killed, passed]);
+        let folded = fold_run(&[killed, passed]);
         let failed = folded
             .modules
             .iter()
@@ -1462,7 +1509,7 @@ mod tests {
         // reported any outcome.
         let killed = journal("fixture", "integration", "adds", None);
         assert!(killed.tests.is_empty(), "the process reported no outcome");
-        let folded = fold(&[killed]);
+        let folded = fold_run(&[killed]);
         assert_eq!(status_of(&folded, Some("fixture"), Some("integration")), Status::Fail);
         assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
         assert_eq!(status_of(&folded, None, None), Status::Fail);
@@ -1473,7 +1520,7 @@ mod tests {
         let passed = journal("fixture", "integration", "adds", Some(Status::Pass));
         let skipped = journal("fixture", "integration", "ignored", Some(Status::Skip));
         let failed = journal("fixture", "basic::tests", "fails", Some(Status::Fail));
-        let folded = fold(&[passed, skipped, failed]);
+        let folded = fold_run(&[passed, skipped, failed]);
         assert_eq!(status_of(&folded, Some("fixture"), Some("integration")), Status::Pass);
         assert_eq!(status_of(&folded, Some("fixture"), Some("basic::tests")), Status::Fail);
         assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
@@ -1484,7 +1531,7 @@ mod tests {
 
     #[test]
     fn a_suite_of_skipped_tests_is_skipped() {
-        let folded = fold(&[journal("fixture", "integration", "ignored", Some(Status::Skip))]);
+        let folded = fold_run(&[journal("fixture", "integration", "ignored", Some(Status::Skip))]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Skip);
     }
 
@@ -1495,7 +1542,7 @@ mod tests {
         let mut second = journal("two", "tests", "b", Some(Status::Pass));
         second.module = "two".to_string();
         second.working_directory = "fixtures/two".to_string();
-        let folded = fold(&[first, second]);
+        let folded = fold_run(&[first, second]);
         assert_eq!(folded.modules.len(), 2);
         assert_eq!(status_of(&folded, None, None), Status::Pass);
         assert_eq!(folded.session.working_directory, ".", "modules disagree");
@@ -1513,7 +1560,7 @@ mod tests {
         second.end = 50;
         second.suites[0].start = 10;
         second.suites[0].end = 50;
-        let folded = fold(&[first, second]);
+        let folded = fold_run(&[first, second]);
         assert_eq!((folded.session.start, folded.session.end), (10, 50));
         assert_eq!((folded.modules[0].start, folded.modules[0].end), (10, 50));
         assert_eq!((folded.suites[0].start, folded.suites[0].end), (10, 50));
@@ -1531,7 +1578,7 @@ mod tests {
         with.early_flake_detection = true;
         with.efd_faulty = true;
         with.test_management = true;
-        let folded = fold(&[without, with]);
+        let folded = fold_run(&[without, with]);
         assert!(folded.session.early_flake_detection && folded.session.test_management);
         assert!(folded.session.faulty);
         assert!(folded.modules[0].early_flake_detection && folded.modules[0].test_management);
@@ -1543,7 +1590,7 @@ mod tests {
         let mut failed = journal("fixture", "basic::tests", "fails", Some(Status::Fail));
         failed.module = "fixture".to_string();
         failed.early_flake_detection = true;
-        let folded = fold(&[passed, failed]);
+        let folded = fold_run(&[passed, failed]);
         let spans = emit("run", &context(), &folded);
         assert_eq!(spans.len(), 4, "two suites, one module and one session");
         let session = spans.last().unwrap();
@@ -1560,7 +1607,7 @@ mod tests {
 
     #[test]
     fn reports_a_single_module_on_the_session() {
-        let folded = fold(&[journal("fixture", "integration", "adds", Some(Status::Pass))]);
+        let folded = fold_run(&[journal("fixture", "integration", "adds", Some(Status::Pass))]);
         let spans = emit("run", &context(), &folded);
         assert_eq!(spans.last().unwrap().meta["test.module"], "fixture");
     }
@@ -1599,7 +1646,7 @@ mod tests {
         let finalizer = elected.finish(1, Vec::new(), true, false);
         let journals = read_journals(&dir_path);
         assert_eq!(journals.len(), 1, "only the process that reported counts");
-        assert!(!fold(&journals).session.incomplete);
+        assert!(!fold_run(&journals).session.incomplete);
         drop(finalizer);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1625,7 +1672,7 @@ mod tests {
             &limits(Duration::from_secs(10), Duration::from_millis(100)),
         );
         assert_eq!(journals.len(), 1, "the journal of the run is not stranded");
-        assert!(!fold(&journals).session.incomplete);
+        assert!(!fold_run(&journals).session.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1654,7 +1701,7 @@ mod tests {
             &limits(Duration::from_secs(10), Duration::from_millis(100)),
         );
         assert_eq!(journals.len(), 1);
-        assert!(!fold(&journals).session.incomplete, "the run is still reported");
+        assert!(!fold_run(&journals).session.incomplete, "the run is still reported");
         drop(finalizer);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1716,7 +1763,7 @@ mod tests {
             journals[0].tests.is_empty(),
             "the results of another version are not trusted"
         );
-        assert!(fold(&journals).session.incomplete);
+        assert!(fold_run(&journals).session.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1728,7 +1775,24 @@ mod tests {
         let journals = read_journals(&dir);
         assert_eq!(journals.len(), 1, "the process is not skipped");
         assert!(!journals[0].complete);
-        assert!(fold(&journals).session.incomplete);
+        assert!(fold_run(&journals).session.incomplete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_with_no_readable_journal_reports_the_session_of_its_finalizer() {
+        let dir = temp_dir("unreadable-run");
+        std::fs::write(dir.join("j-broken.json"), b"{\"v\":1,").unwrap();
+        let mut written = journal("fixture", "integration", "a", Some(Status::Pass));
+        written.v = JOURNAL_VERSION + 1;
+        write_json(&dir.join("j-next.json"), &written).unwrap();
+
+        let folded = fold(&read_journals(&dir), own());
+        let spans = emit("run", &context(), &folded);
+        let session = spans.last().unwrap();
+        assert_eq!(session.kind, Kind::Session);
+        assert_eq!(session.start, 5, "the session of this process started the run");
+        assert_eq!(session.meta["test.working_directory"], "fixtures/basic");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1873,7 +1937,7 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
 
-        let folded = fold(&read_journals(&dir_path));
+        let folded = fold_run(&read_journals(&dir_path));
         assert!(folded.session.incomplete);
         assert!(folded.modules[0].incomplete);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1940,7 +2004,7 @@ mod tests {
 
         let journals: Vec<Journal> = entries.into_iter().map(|(_, journal)| journal).collect();
         assert_eq!(journals.len(), 1);
-        let folded = fold(&journals);
+        let folded = fold_run(&journals);
         assert!(
             !folded.session.incomplete,
             "the journal written during the drain counts"
@@ -1979,7 +2043,30 @@ mod tests {
 
         assert_eq!(entries.len(), 1, "a process that cannot be read stays incomplete");
         let journals: Vec<Journal> = entries.into_iter().map(|(_, journal)| journal).collect();
-        assert!(fold(&journals).session.incomplete);
+        assert!(fold_run(&journals).session.incomplete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_stops_reading_during_the_drain_keeps_what_it_reported() {
+        let dir = temp_dir("reread-version");
+        let mut marker = journal("fixture", "integration", "adds", None);
+        marker.state = State::Running;
+        let path = dir.join("j-live.json");
+        write_json(&path, &marker).unwrap();
+
+        let mut entries = read_entries(&dir);
+        let mut replaced = marker.clone();
+        replaced.v = JOURNAL_VERSION + 1;
+        write_json(&path, &replaced).unwrap();
+        reread(&mut entries);
+
+        assert_eq!(entries.len(), 1, "a process whose journal stops reading is not dropped");
+        assert_eq!(
+            entries[0].1, marker,
+            "the snapshot keeps its module, attempt and identity"
+        );
+        assert!(!entries[0].1.complete, "the process never reported its results");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
