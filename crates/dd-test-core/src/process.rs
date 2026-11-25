@@ -3,10 +3,48 @@
 
 //! The command line of another process, read without spawning one.
 
+use std::path::Path;
+
 /// The command line of `pid`, joined like `ps -o command=`, or `None` when the
 /// lookup fails or `ps` would escape an argument.
 pub fn command(pid: u32) -> Option<String> {
     render(&arguments(pid)?)
+}
+
+/// The Cargo command that started `pid`, without the directory of `cargo`, or
+/// `None` when it is not Cargo.
+#[cfg(unix)]
+pub fn cargo_command(pid: u32) -> Option<String> {
+    resolve(command(pid), || ps(pid))
+}
+
+#[cfg(unix)]
+fn resolve(native: Option<String>, ps: impl FnOnce() -> Option<String>) -> Option<String> {
+    let line = native.or_else(ps)?;
+    let line = line.trim();
+    let (program, rest) = line.split_once(' ').unwrap_or((line, ""));
+    let program = file_name(program);
+    program
+        .starts_with("cargo")
+        .then(|| format!("{program} {rest}").trim().to_string())
+}
+
+#[cfg(unix)]
+fn ps(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    output.status.success().then_some(line)
+}
+
+#[cfg(unix)]
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 fn render(args: &[String]) -> Option<String> {
@@ -244,5 +282,62 @@ mod tests {
             return;
         }
         assert_eq!(native, String::from_utf8_lossy(&ps.stdout).trim());
+    }
+
+    #[cfg(unix)]
+    fn resolve_line(line: &str) -> Option<String> {
+        resolve(Some(line.to_string()), || None)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_cargo_without_its_directory_and_drops_other_commands() {
+        assert_eq!(resolve_line("cargo test --lib"), Some("cargo test --lib".to_string()));
+        assert_eq!(resolve_line(" /usr/bin/cargo test "), Some("cargo test".to_string()));
+        assert_eq!(resolve_line("/usr/bin/cargo"), Some("cargo".to_string()));
+        assert_eq!(resolve_line("/usr/bin/python3 -m pytest"), None);
+        assert_eq!(resolve_line(""), None);
+        assert_eq!(resolve(None, || None), None, "neither lookup found a command");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_native_lookup_and_never_runs_ps() {
+        let native = Some("cargo test".to_string());
+        let resolved = resolve(native.clone(), || panic!("native lookup succeeded"));
+        assert_eq!(resolved, native);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn falls_back_to_ps_with_the_same_command() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::process::CommandExt;
+
+        // ps reports argv[0], so a cat named cargo prints the line Cargo would.
+        let mut child = std::process::Command::new("cat")
+            .arg0("/usr/bin/cargo")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "cat has started").unwrap();
+        // posix_spawn resumes the parent before the child has exec'd, and cat
+        // echoing a line proves it runs.
+        let mut echo = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut echo)
+            .unwrap();
+        assert_eq!(echo, "cat has started\n");
+        let native = resolve(command(pid), || None);
+        let fallback = resolve(None, || ps(pid));
+        drop(stdin);
+        child.wait().unwrap();
+        assert_eq!(native.as_deref(), Some("cargo -"));
+        let Some(line) = fallback else { return };
+        assert_eq!(line, "cargo -");
     }
 }

@@ -369,24 +369,7 @@ fn command() -> String {
 
 #[cfg(unix)]
 fn parent_command() -> Option<String> {
-    let parent = std::os::unix::process::parent_id();
-    let line = dd_test_core::process::command(parent).or_else(|| ps_command(parent))?;
-    let line = line.trim();
-    let (program, rest) = line.split_once(' ').unwrap_or((line, ""));
-    let program = file_name(program);
-    program
-        .starts_with("cargo")
-        .then(|| format!("{program} {rest}").trim().to_string())
-}
-
-#[cfg(unix)]
-fn ps_command(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    output.status.success().then_some(line)
+    dd_test_core::process::cargo_command(std::os::unix::process::parent_id())
 }
 
 #[cfg(not(unix))]
