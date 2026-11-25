@@ -32,7 +32,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const NEXTEST: &str = "nextest";
 const LOCK: &str = "finalizer.lock";
 const CONTEXT: &str = "context.json";
@@ -211,6 +211,7 @@ struct Journal {
     attempt: u32,
     stress: Option<u64>,
     module: String,
+    service: String,
     working_directory: String,
     start: i64,
     end: i64,
@@ -413,6 +414,7 @@ impl Member {
             attempt: self.attempt,
             stress: self.stress,
             module: self.module.clone(),
+            service: self.context.service.clone(),
             working_directory: self.working_directory.clone(),
             start: self.start,
             end: self.start,
@@ -761,6 +763,7 @@ fn unreadable_journal() -> Journal {
         attempt: 0,
         stress: None,
         module: String::new(),
+        service: String::new(),
         working_directory: String::new(),
         start: 0,
         end: 0,
@@ -909,6 +912,7 @@ struct Folded {
 struct FoldedSuite {
     module: String,
     name: String,
+    service: String,
     working_directory: String,
     start: i64,
     end: i64,
@@ -918,6 +922,8 @@ struct FoldedSuite {
 
 struct FoldedContainer {
     module: Option<String>,
+    /// The service of the package, `None` on the session, which keeps the service of the run.
+    service: Option<String>,
     working_directory: String,
     start: i64,
     end: i64,
@@ -949,6 +955,7 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
 
     let mut session = FoldedContainer {
         module: None,
+        service: None,
         working_directory: String::new(),
         start: 0,
         end: 0,
@@ -974,6 +981,7 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
             .entry(journal.module.clone())
             .or_insert_with(|| FoldedContainer {
                 module: Some(journal.module.clone()),
+                service: Some(journal.service.clone()),
                 working_directory: journal.working_directory.clone(),
                 start: journal.start,
                 end: journal.end,
@@ -991,6 +999,7 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
                 .or_insert_with(|| FoldedSuite {
                     module: journal.module.clone(),
                     name: suite.name.clone(),
+                    service: journal.service.clone(),
                     working_directory: journal.working_directory.clone(),
                     start: suite.start,
                     end: suite.end,
@@ -1089,7 +1098,7 @@ fn emit(run_id: &str, context: &Context, folded: &Folded) -> Vec<Span> {
             Kind::Suite,
             "libtest.test_suite",
             &resource,
-            &context.service,
+            &suite.service,
             suite.start,
         );
         span.session_id = session_id;
@@ -1116,7 +1125,7 @@ fn emit(run_id: &str, context: &Context, folded: &Folded) -> Vec<Span> {
             Kind::Module,
             "libtest.test_module",
             &resource,
-            &context.service,
+            module.service.as_deref().unwrap_or(&context.service),
             module.start,
         );
         span.session_id = session_id;
@@ -1399,6 +1408,7 @@ mod tests {
             attempt: 1,
             stress: None,
             module: module.to_string(),
+            service: "fixture".to_string(),
             working_directory: format!("fixtures/{module}"),
             start: 10,
             end: 20,
@@ -1641,6 +1651,63 @@ mod tests {
         let module = spans.iter().find(|span| span.kind == Kind::Module).unwrap();
         assert_eq!(module.meta["test.module"], "fixture");
         assert!(!module.meta.contains_key("error.message"));
+    }
+
+    #[test]
+    fn a_package_keeps_its_service_on_its_suites_and_its_module() {
+        // Two packages of one workspace, each with the service of its package
+        // because the run sets neither DD_SERVICE nor a repository URL.
+        let dir = temp_dir("services");
+        let member = |module: &str, service: &str, test: &str| {
+            let mut session = session_info(10);
+            session.module = module.to_string();
+            session.crate_name = "tests".to_string();
+            session.context.service = service.to_string();
+            let run = RunEnv {
+                run_id: "0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10".to_string(),
+                binary_id: format!("{module}::tests"),
+                test_name: test.to_string(),
+                attempt: 1,
+                stress: None,
+            };
+            let suite = SuiteEntry {
+                name: "tests".to_string(),
+                start: 10,
+                end: 20,
+                source_file: None,
+            };
+            Member::open(&dir, run, None, session)
+                .unwrap()
+                .finish(20, vec![suite], true, false)
+        };
+        let run_dir = {
+            let _first = member("a", "package-a", "one");
+            let _second = member("b", "package-b", "two");
+            dir.join("0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10")
+        };
+
+        let context = read_context(&run_dir).unwrap();
+        let folded = fold_run(&read_journals(&run_dir));
+        let spans = emit("run", &context, &folded);
+        let service_of = |kind: Kind, module: &str| -> String {
+            spans
+                .iter()
+                .find(|span| span.kind == kind && span.meta.get("test.module").map(String::as_str) == Some(module))
+                .unwrap()
+                .service
+                .clone()
+        };
+
+        for (module, package) in [("a", "package-a"), ("b", "package-b")] {
+            assert_eq!(service_of(Kind::Suite, module), package);
+            assert_eq!(service_of(Kind::Module, module), package);
+        }
+        assert_eq!(
+            spans.last().unwrap().service,
+            "package-a",
+            "the session keeps the service of the run context"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
