@@ -182,7 +182,7 @@ nextest runs each test in its own process. A `cargo nextest run` is reported as 
 - With `--retries`, each attempt is reported as its own test execution. Suites, modules and the session take the result of the last attempt.
 - `DD_CIVISIBILITY_TOTAL_FLAKY_RETRY_COUNT` limits the retries of each test, not of the whole run.
 - Early Flake Detection does not detect runs with too many new tests.
-- nextest versions that do not set `NEXTEST_BINARY_ID` or `NEXTEST_WORKSPACE_ROOT` report each test as its own test session.
+- nextest versions that do not set `NEXTEST_BINARY_ID` or `NEXTEST_WORKSPACE_ROOT` report each test as its own test session, and so does a machine where the harness cannot read the command of the parent process, such as one without `ps`.
 
 With `DD_TRACE_DEBUG=true`, the run writes its debug log to `<read cache dir>/nextest/<run id>.log`.
 

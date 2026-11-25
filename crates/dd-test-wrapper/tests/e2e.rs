@@ -477,6 +477,19 @@ fn nextest_reports_one_session_for_the_run() {
         for test in &tests {
             assert_eq!(&test["content"]["test_module_id"], module_id);
         }
+        let start = |event: &Value| event["content"]["start"].as_i64().expect("every event has a start");
+        let (module_start, session_start) = (start(module), start(session));
+        assert!(session_start <= module_start, "the session starts before its module");
+        for event in tests.iter().chain(ends.iter()) {
+            assert!(
+                session_start <= start(event),
+                "the session starts before every suite and test"
+            );
+            assert!(
+                module_start <= start(event),
+                "the module starts before every suite and test"
+            );
+        }
         for end in &ends {
             let suite = meta(end, "test.suite");
             for test in tests.iter().filter(|test| meta(test, "test.suite") == suite) {

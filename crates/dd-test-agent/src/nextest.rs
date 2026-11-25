@@ -16,7 +16,7 @@
 
 use crate::config::Config;
 use crate::event::{encode_payload, Kind, Metadata, Span};
-use crate::ids::{new_id, now_nanos};
+use crate::ids::new_id;
 use crate::read_cache;
 use crate::session::{self, Counts, INCOMPLETE_MESSAGE};
 use crate::telemetry::Telemetry;
@@ -52,9 +52,14 @@ pub(crate) fn join(
     module: &str,
     repo_root: &Path,
     runtime_id: &str,
+    start: i64,
     context: impl FnOnce() -> Context,
 ) -> Option<Member> {
     let run = RunEnv::from_env()?;
+    if !runner_command(&hello.command) {
+        debug!("nextest: the command that started the tests is not nextest, reporting one session per test process");
+        return None;
+    }
     let Some(runner) = nextest_parent(hello.parent_pid) else {
         debug!("nextest: cargo-nextest did not start the test binary");
         return None;
@@ -64,20 +69,31 @@ pub(crate) fn join(
         return None;
     };
     let root = read_cache::default_dir().join(NEXTEST);
-    let member = Member::open(
-        &root,
-        run,
-        Some(runner),
-        module,
-        &working_directory,
-        runtime_id,
-        context(),
-    )?;
+    let session = SessionInfo {
+        module: module.to_string(),
+        working_directory,
+        runtime_id: runtime_id.to_string(),
+        start,
+        context: context(),
+    };
+    let member = Member::open(&root, run, Some(runner), session)?;
     if member.lock.is_some() {
         // The finalizer outlives nextest, which kills the process group of a test when it times out.
         detach();
     }
     Some(member)
+}
+
+/// The harness falls back to the arguments of the test binary when it cannot
+/// read the parent process, which differ from test to test. Only the command of
+/// the nextest process keeps the session fingerprint of the run the same.
+fn runner_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    match words.next() {
+        Some("cargo-nextest") => true,
+        Some("cargo") => words.next() == Some("nextest"),
+        _ => false,
+    }
 }
 
 /// The working directory every event of the run reports, relative to the
@@ -197,12 +213,22 @@ struct Journal {
     tests: Vec<TestEntry>,
 }
 
-/// The part of the run this process has to report.
+/// What the session of this test binary tells the run. Its start is the one the
+/// session took before its first test, so no suite or test of the run starts
+/// before the session.
+struct SessionInfo {
+    module: String,
+    working_directory: String,
+    runtime_id: String,
+    start: i64,
+    context: Context,
+}
+
 pub(crate) struct Member {
     run_id: String,
     dir: PathBuf,
     marker: PathBuf,
-    /// The run's lock. Held from the moment this process is the finalizer.
+    /// Held from the moment this process is the finalizer.
     lock: Option<File>,
     runner: Option<ProcessId>,
     context: Context,
@@ -221,15 +247,7 @@ pub(crate) struct Member {
 }
 
 impl Member {
-    fn open(
-        root: &Path,
-        run: RunEnv,
-        runner: Option<ProcessId>,
-        module: &str,
-        working_directory: &str,
-        runtime_id: &str,
-        context: Context,
-    ) -> Option<Member> {
+    fn open(root: &Path, run: RunEnv, runner: Option<ProcessId>, session: SessionInfo) -> Option<Member> {
         let started = Instant::now();
         let dir = root.join(&run.run_id);
         if let Err(error) = read_cache::create_dir(&dir) {
@@ -251,22 +269,22 @@ impl Member {
         };
         let member = Member {
             session_id: derived_id(&[&run.run_id, "session"]),
-            module_id: derived_id(&[&run.run_id, "module", module]),
+            module_id: derived_id(&[&run.run_id, "module", &session.module]),
             marker: dir.join(format!("j-{}-{:x}.json", std::process::id(), new_id())),
             dir,
             run_id: run.run_id,
             lock,
             runner,
-            context,
-            runtime_id: runtime_id.to_string(),
+            context: session.context,
+            runtime_id: session.runtime_id,
             binary_id: run.binary_id,
             test_name: run.test_name,
             attempt: run.attempt,
             stress: run.stress,
-            module: module.to_string(),
-            working_directory: working_directory.to_string(),
+            module: session.module,
+            working_directory: session.working_directory,
             pstart: process_info(std::process::id()).map_or(0, |info| info.start),
-            start: now_nanos(),
+            start: session.start,
             tests: Vec::new(),
         };
         if let Err(error) = write_json(&member.marker, &member.journal()) {
@@ -333,12 +351,29 @@ impl Member {
             ),
         }
         write_context(&self.dir, &self.context);
+        self.finalizer()
+    }
+
+    /// Leaves the run without reporting anything: the process exits before the
+    /// tests finish, so its journal must not count as incomplete. A member
+    /// leaves the run to another process of the run, while the finalizer keeps
+    /// it and reports the run from `close`.
+    pub(crate) fn withdraw(self) -> Option<Finalizer> {
+        if let Err(error) = std::fs::remove_file(&self.marker) {
+            debug!("nextest: could not withdraw the marker: {error}");
+        }
+        self.lock.as_ref()?;
+        Some(self.finalizer())
+    }
+
+    fn finalizer(self) -> Finalizer {
+        let root = self
+            .dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.dir.clone());
         Finalizer {
-            root: self
-                .dir
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.dir.clone()),
+            root,
             run_id: self.run_id,
             dir: self.dir,
             runner: self.runner,
@@ -346,15 +381,6 @@ impl Member {
             runtime_id: self.runtime_id,
             context: self.context,
             limits: Limits::default(),
-        }
-    }
-
-    /// Leaves the run without reporting anything: the process exits before the
-    /// tests finish, so its journal must not count as incomplete. Dropping the
-    /// lock lets another process of the run report it.
-    pub(crate) fn withdraw(self) {
-        if let Err(error) = std::fs::remove_file(&self.marker) {
-            debug!("nextest: could not withdraw the marker: {error}");
         }
     }
 
@@ -388,7 +414,7 @@ pub(crate) struct Finalizer {
     run_id: String,
     dir: PathBuf,
     runner: Option<ProcessId>,
-    /// The run's lock when this process took it at the start of the run.
+    /// The lock when this process took it at the start of the run.
     lock: Option<File>,
     /// The runtime id of this process, so its container events match its tests.
     runtime_id: String,
@@ -486,13 +512,15 @@ impl Finalizer {
             env: context.env.clone(),
             session_name: context.session_name.clone(),
         };
-        let mut sent = 0;
-        for batch in batches(&metadata, &spans) {
-            if session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, batch) {
-                sent += batch.len();
-            }
+        let batches = batches(&metadata, &spans);
+        for batch in &batches {
+            session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, batch);
         }
-        debug!("nextest: sent {sent} of {} container events", spans.len());
+        debug!(
+            "nextest: sent {} container events in {} batches",
+            spans.len(),
+            batches.len()
+        );
         if let Some(telemetry) = &telemetry {
             telemetry.stop();
         }
@@ -517,13 +545,27 @@ impl Default for Limits {
     }
 }
 
-/// Waits for nextest to exit, then for the test processes that are still
-/// writing, and reads every journal of the run once.
+/// Waits for nextest to exit, then for the processes that are still writing
+/// their journal, and collects the journals of the run once they stopped.
 fn gather(dir: &Path, runner: Option<ProcessId>, limits: &Limits) -> Vec<Journal> {
     wait_for_runner(runner, limits);
-    let journals = read_journals(dir);
-    drain(&journals, limits);
-    journals
+    let mut entries = read_entries(dir);
+    let running: Vec<Journal> = entries
+        .iter()
+        .filter(|(_, journal)| writing(journal))
+        .map(|(_, journal)| journal.clone())
+        .collect();
+    drain(&running, limits);
+    // A process that wrote its journal while the finalizer waited would
+    // otherwise count as incomplete.
+    for (path, journal) in &mut entries {
+        if writing(journal) {
+            if let Some(latest) = read_journal(path) {
+                *journal = latest;
+            }
+        }
+    }
+    entries.into_iter().map(|(_, journal)| journal).collect()
 }
 
 fn wait_for_runner(runner: Option<ProcessId>, limits: &Limits) {
@@ -584,6 +626,10 @@ fn alive(journal: &Journal) -> bool {
 }
 
 fn read_journals(dir: &Path) -> Vec<Journal> {
+    read_entries(dir).into_iter().map(|(_, journal)| journal).collect()
+}
+
+fn read_entries(dir: &Path) -> Vec<(PathBuf, Journal)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -593,15 +639,22 @@ fn read_journals(dir: &Path) -> Vec<Journal> {
         if !(name.starts_with("j-") && name.ends_with(".json")) {
             continue;
         }
-        match std::fs::read(entry.path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(journal) => journals.push(journal),
+        match read_journal(&entry.path()) {
+            Some(journal) => journals.push((entry.path(), journal)),
             None => debug!("nextest: unreadable journal {}", entry.path().display()),
         }
     }
     journals
+}
+
+fn read_journal(path: &Path) -> Option<Journal> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut journal: Journal = serde_json::from_slice(&bytes).ok()?;
+    if journal.v != JOURNAL_VERSION {
+        debug!("nextest: journal version {} at {}", journal.v, path.display());
+        journal.complete = false;
+    }
+    Some(journal)
 }
 
 fn read_context(dir: &Path) -> Option<Context> {
@@ -652,13 +705,9 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     })
 }
 
-/// Removes the directories and logs of runs that ended a while ago.
 fn cleanup_stale(root: &Path) {
     cleanup_stale_within(root, CLEANUP_MAX_DURATION);
 }
-
-/// The same, waiting up to `max_duration` and checking a few entries, so the
-/// cache does not grow one directory per run.
 fn cleanup_stale_within(root: &Path, max_duration: Duration) {
     let started = Instant::now();
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -704,8 +753,6 @@ fn keeps_writing(dir: &Path) -> bool {
         .any(|journal| writing(journal) && alive(journal))
 }
 
-/// Splits the container events of a run into payloads the intake accepts: the
-/// uploader's batch size, and no more than the uncompressed payload limit.
 fn batches<'a>(metadata: &Metadata, spans: &'a [Span]) -> Vec<&'a [Span]> {
     batches_within(metadata, spans, MAX_PAYLOAD)
 }
@@ -759,9 +806,8 @@ struct FoldedContainer {
     test_management: bool,
 }
 
-/// Folds the journals of one run into one suite per suite name, one module per
-/// package and one session. Only the last attempt of each test counts, since
-/// nextest runs a retry in a new process.
+/// Only the last attempt of each test counts, since nextest runs a retry in a
+/// new process.
 fn fold(journals: &[Journal]) -> Folded {
     let mut kept: BTreeMap<(&str, &str, Option<u64>), &Journal> = BTreeMap::new();
     for journal in journals {
@@ -841,6 +887,28 @@ fn fold(journals: &[Journal]) -> Folded {
             }
             module.counts.add(status);
             session.counts.add(status);
+        }
+    }
+
+    // A test whose last attempt was killed reported no outcome of its own. It
+    // still failed in the suites of its earlier attempts, which would otherwise
+    // count as skipped while their module and the session fail.
+    for (key, journal) in &kept {
+        if journal.complete || !journal.tests.is_empty() {
+            continue;
+        }
+        for earlier in journals
+            .iter()
+            .filter(|earlier| earlier.binary_id == key.0 && earlier.test_name == key.1 && earlier.stress == key.2)
+        {
+            if std::ptr::eq(earlier, *journal) {
+                continue;
+            }
+            for suite in &earlier.suites {
+                if let Some(folded) = suites.get_mut(&(earlier.module.as_str(), suite.name.as_str())) {
+                    folded.counts.add(Status::Fail);
+                }
+            }
         }
     }
 
@@ -1141,15 +1209,22 @@ mod tests {
         }
     }
 
+    fn session_info(start: i64) -> SessionInfo {
+        SessionInfo {
+            module: "fixture".to_string(),
+            working_directory: "fixtures/basic".to_string(),
+            runtime_id: "0123456789abcdef".to_string(),
+            start,
+            context: context(),
+        }
+    }
+
     fn join_in(dir: &Path) -> Option<Member> {
         Member::open(
             dir,
             run_env("0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10"),
             None,
-            "fixture",
-            "fixtures/basic",
-            "0123456789abcdef",
-            context(),
+            session_info(5),
         )
     }
 
@@ -1242,6 +1317,33 @@ mod tests {
         let folded = fold(&[killed, passed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
         assert!(!folded.session.incomplete);
+    }
+
+    #[test]
+    fn a_killed_last_attempt_fails_the_suite_of_a_failed_earlier_attempt() {
+        let mut failed = journal("fixture", "integration", "a", Some(Status::Fail));
+        failed.attempt = 1;
+        let mut killed = journal("fixture", "integration", "a", None);
+        killed.attempt = 2;
+        killed.suites.clear();
+
+        let folded = fold(&[failed, killed]);
+        assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
+        assert!(folded.session.incomplete);
+    }
+
+    #[test]
+    fn a_killed_last_attempt_fails_the_suite_of_a_passed_earlier_attempt() {
+        let mut passed = journal("fixture", "integration", "a", Some(Status::Pass));
+        passed.attempt = 1;
+        let mut killed = journal("fixture", "integration", "a", None);
+        killed.attempt = 2;
+        killed.suites.clear();
+
+        let folded = fold(&[passed, killed]);
+        assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
+        assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
+        assert_eq!(status_of(&folded, None, None), Status::Fail);
     }
 
     #[test]
@@ -1376,20 +1478,52 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_agent_withdraws_its_marker_and_lets_another_process_report() {
+    fn a_cancelled_member_withdraws_its_marker() {
         let dir = temp_dir("cancel");
+        let elected = join_in(&dir).unwrap();
+        let member = join_in(&dir).unwrap();
+        let marker = member.marker.clone();
+        let dir_path = elected.dir.clone();
+        assert!(member.withdraw().is_none(), "only the finalizer reports the run");
+        assert!(!marker.exists(), "a process that reports nothing leaves no marker");
+
+        let finalizer = elected.finish(1, Vec::new(), true, false);
+        let journals = read_journals(&dir_path);
+        assert_eq!(journals.len(), 1, "only the process that reported counts");
+        assert!(!fold(&journals).session.incomplete);
+        drop(finalizer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_finalizer_still_reports_the_run() {
+        let dir = temp_dir("cancel-finalizer");
         let elected = join_in(&dir).unwrap();
         let member = join_in(&dir).unwrap();
         let marker = elected.marker.clone();
         let dir_path = elected.dir.clone();
-        elected.withdraw();
-        assert!(!marker.exists(), "a process that reports nothing leaves no marker");
 
-        let finalizer = member.finish(2, Vec::new(), true, false);
-        eventually(|| finalizer.take_over());
-        let journals = read_journals(&dir_path);
-        assert_eq!(journals.len(), 1, "only the process that reported counts");
-        assert!(!fold(&journals).session.incomplete);
+        // The member finishes first and finds the run taken by the elected agent.
+        let finished = member.finish(2, Vec::new(), true, false);
+        assert!(finished.take_over().is_none());
+
+        let finalizer = elected
+            .withdraw()
+            .expect("the elected agent keeps the run when its test binary cancels");
+        assert!(!marker.exists());
+        assert!(
+            read_cache::existing_guard(&dir_path.join(LOCK)).unwrap().is_none(),
+            "the lock stays with the finalizer"
+        );
+        assert!(finalizer.lock.is_some());
+        let journals = gather(
+            &dir_path,
+            None,
+            &limits(Duration::from_secs(10), Duration::from_millis(100)),
+        );
+        assert_eq!(journals.len(), 1);
+        assert!(!fold(&journals).session.incomplete, "the run is still reported");
+        drop(finalizer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1427,6 +1561,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_marker_starts_when_the_session_started() {
+        let dir = temp_dir("start");
+        let member = join_in(&dir).unwrap();
+        let journal = read_journals(&member.dir).pop().unwrap();
+        assert_eq!(journal.start, 5, "the session starts before its first test");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_journal_of_an_unknown_version_counts_as_incomplete() {
+        let dir = temp_dir("version");
+        let mut written = journal("fixture", "integration", "a", Some(Status::Pass));
+        written.v = JOURNAL_VERSION + 1;
+        write_json(&dir.join("j-next.json"), &written).unwrap();
+
+        let journals = read_journals(&dir);
+        assert_eq!(journals.len(), 1);
+        assert!(!journals[0].complete);
+        assert!(fold(&journals).session.incomplete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Retries `f` for a while. A child process forked by another test shares
     /// open files until it execs, so it can briefly hold a released lock.
     fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> T {
@@ -1446,6 +1603,29 @@ mod tests {
         (child, id)
     }
 
+    /// A child that exits when the handle it returns is dropped, so a test can
+    /// start a wait and then end it without depending on how long the child takes.
+    fn blocking_runner() -> (std::process::Child, Option<ProcessId>, std::process::ChildStdin) {
+        let mut child = Command::new("sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let id = ProcessId::new(child.id(), process_info(child.id()).map_or(0, |info| info.start));
+        (child, id, stdin)
+    }
+
+    /// Runs a wait in the background, so the test can go on with the handshake
+    /// that ends it.
+    fn waiting<T: Send + 'static>(wait: impl FnOnce() -> T + Send + 'static) -> std::sync::mpsc::Receiver<T> {
+        let (done, wait_for) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(wait());
+        });
+        wait_for
+    }
+
     fn limits(runner_wait: Duration, drain: Duration) -> Limits {
         Limits {
             runner_wait,
@@ -1457,16 +1637,25 @@ mod tests {
     #[test]
     fn waits_for_the_runner_to_exit() {
         let dir = temp_dir("waits");
-        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 0.3"]));
+        let (mut child, id, stdin) = blocking_runner();
         // Reaped while waiting, or Linux keeps it a zombie with the same start
         // time and the wait never ends.
         let reaper = std::thread::spawn(move || child.wait().unwrap());
-        let started = Instant::now();
-        let journals = gather(&dir, id, &limits(Duration::from_secs(10), Duration::from_millis(100)));
-        assert!(started.elapsed() >= Duration::from_millis(300));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        let gathering = dir.clone();
+        let gathered = waiting(move || {
+            gather(
+                &gathering,
+                id,
+                &limits(Duration::from_secs(10), Duration::from_millis(100)),
+            )
+        });
+        assert!(
+            gathered.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the finalizer waits for the runner"
+        );
+        drop(stdin);
+        assert!(gathered.recv_timeout(Duration::from_secs(30)).unwrap().is_empty());
         reaper.join().unwrap();
-        assert!(journals.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1493,15 +1682,22 @@ mod tests {
         let dir = temp_dir("drain");
         let member = join_in(&dir).unwrap();
         let dir_path = member.dir.clone();
-        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 0.3"]));
+        let (mut child, id, stdin) = blocking_runner();
+        let id = id.unwrap();
         let mut marker = member.journal();
-        marker.pid = id.unwrap().pid;
-        marker.pstart = id.unwrap().start;
+        marker.pid = id.pid;
+        marker.pstart = id.start;
         write_json(&dir_path.join("j-live.json"), &marker).unwrap();
         let journals = read_journals(&dir_path);
-        let started = Instant::now();
-        drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
-        assert!(started.elapsed() >= Duration::from_millis(300));
+        let waited = waiting(move || {
+            drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
+        });
+        assert!(
+            waited.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the drain waits for the test process"
+        );
+        drop(stdin);
+        waited.recv_timeout(Duration::from_secs(30)).unwrap();
         child.wait().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1552,25 +1748,69 @@ mod tests {
     }
 
     #[test]
-    fn drains_without_reading_the_journals_again() {
+    fn drain_uses_the_journals_it_was_given() {
         let dir = temp_dir("parse-once");
         let member = join_in(&dir).unwrap();
         let dir_path = member.dir.clone();
-        let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 0.3"]));
+        let (mut child, id, stdin) = blocking_runner();
+        let id = id.unwrap();
         let mut marker = member.journal();
-        marker.pid = id.unwrap().pid;
-        marker.pstart = id.unwrap().start;
+        marker.pid = id.pid;
+        marker.pstart = id.start;
         write_json(&dir_path.join("j-live.json"), &marker).unwrap();
         let journals = read_journals(&dir_path);
         std::fs::remove_dir_all(&dir_path).unwrap();
 
-        let started = Instant::now();
-        drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
+        let waited = waiting(move || {
+            drain(&journals, &limits(Duration::from_secs(10), Duration::from_secs(10)));
+        });
         assert!(
-            started.elapsed() >= Duration::from_millis(300),
+            waited.recv_timeout(Duration::from_millis(100)).is_err(),
             "the process that was running decides, not a second read of the directory"
         );
+        drop(stdin);
+        waited.recv_timeout(Duration::from_secs(30)).unwrap();
         child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rereads_a_marker_that_finished_during_the_drain() {
+        let dir = temp_dir("reread");
+        let (mut child, id, stdin) = blocking_runner();
+        let id = id.unwrap();
+        let mut marker = journal("fixture", "integration", "adds", None);
+        marker.state = State::Running;
+        marker.pid = id.pid;
+        marker.pstart = id.start;
+        let path = dir.join("j-live.json");
+        write_json(&path, &marker).unwrap();
+
+        let gathering = dir.clone();
+        let gathered = waiting(move || {
+            gather(
+                &gathering,
+                None,
+                &limits(Duration::from_secs(10), Duration::from_secs(10)),
+            )
+        });
+        assert!(
+            gathered.recv_timeout(Duration::from_millis(100)).is_err(),
+            "the finalizer waits for the process that was writing"
+        );
+
+        // The process writes its journal while the finalizer waits, then exits.
+        write_json(&path, &journal("fixture", "integration", "adds", Some(Status::Pass))).unwrap();
+        drop(stdin);
+
+        let journals = gathered.recv_timeout(Duration::from_secs(30)).unwrap();
+        child.wait().unwrap();
+        let folded = fold(&journals);
+        assert!(
+            !folded.session.incomplete,
+            "the journal written during the drain counts"
+        );
+        assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1721,6 +1961,20 @@ mod tests {
             nextest_parent(Some(std::process::id())).is_none(),
             "the test binary of a nested cargo test does not join the outer run"
         );
+    }
+
+    #[test]
+    fn only_the_command_of_nextest_joins_the_run() {
+        assert!(runner_command(
+            "cargo-nextest nextest --user-config-file none run --no-fail-fast"
+        ));
+        assert!(runner_command("cargo nextest run"));
+        assert!(
+            !runner_command("basic_fixture-0123456789abcdef --exact integration::adds"),
+            "the harness reports the arguments of the test binary when it cannot read the parent"
+        );
+        assert!(!runner_command("cargo test --no-fail-fast"));
+        assert!(!runner_command(""));
     }
 
     #[test]

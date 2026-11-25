@@ -135,6 +135,7 @@ struct Content<'a> {
     metrics: &'a BTreeMap<String, f64>,
 }
 
+#[derive(Clone)]
 pub struct Metadata {
     pub runtime_id: String,
     pub library_version: String,

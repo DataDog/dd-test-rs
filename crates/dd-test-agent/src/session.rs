@@ -15,6 +15,7 @@ use dd_test_core::protocol::{
     AutoTestRetries, Bootstrap, EarlyFlakeDetection, Finish, Hello, Status, TestManagement, TestRecord,
 };
 use dd_test_core::{debug, warn};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,14 +67,11 @@ pub struct AgentSession {
     telemetry: Option<Arc<Telemetry>>,
     provider: String,
     service: String,
-    env: String,
     module: String,
     command: String,
-    session_name: String,
     working_directory: String,
     repo_root: PathBuf,
-    /// The id the finalizer of a nextest run reuses, so its events match this process.
-    runtime_id: String,
+    metadata: Metadata,
     common: Tags,
     session_id: u64,
     module_id: u64,
@@ -83,7 +81,7 @@ pub struct AgentSession {
     suites: BTreeMap<String, SuiteState>,
     counts: Counts,
     run: Option<nextest::Member>,
-    finalizer: Option<nextest::Finalizer>,
+    finalizer: Cell<Option<nextest::Finalizer>>,
 }
 
 impl AgentSession {
@@ -181,19 +179,16 @@ impl AgentSession {
         bootstrap.repo_root = Some(repo_root.to_string_lossy().to_string());
 
         let working_directory = relative_directory(&repo_root, &working_dir);
-        let session_name = session_name(config.session_name.as_deref(), &tags, &hello.command);
-        let runtime_id = format!("{:016x}{:016x}", new_id(), new_id());
         let metadata = Metadata {
-            runtime_id: runtime_id.clone(),
+            runtime_id: format!("{:016x}{:016x}", new_id(), new_id()),
             library_version: hello.library_version.clone(),
-            env: env.clone(),
-            session_name: session_name.clone(),
+            env,
+            session_name: session_name(config.session_name.as_deref(), &tags, &hello.command),
         };
         let uploader = Uploader::start({
             let telemetry = telemetry.clone();
-            move |spans| {
-                upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans);
-            }
+            let metadata = metadata.clone();
+            move |spans| upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans)
         });
         let session = AgentSession {
             uploader,
@@ -203,13 +198,11 @@ impl AgentSession {
                 .cloned()
                 .unwrap_or_else(|| "unsupported".to_string()),
             service,
-            env,
             module: hello.module.clone(),
             command: hello.command.clone(),
-            session_name,
             working_directory,
             repo_root,
-            runtime_id,
+            metadata,
             common,
             session_id: new_id(),
             module_id: new_id(),
@@ -219,7 +212,7 @@ impl AgentSession {
             suites: BTreeMap::new(),
             counts: Counts::default(),
             run: None,
-            finalizer: None,
+            finalizer: Cell::new(None),
         };
         (session, bootstrap)
     }
@@ -230,17 +223,24 @@ impl AgentSession {
     pub fn join_run(&mut self, hello: &Hello) {
         let context = || nextest::Context {
             service: self.service.clone(),
-            env: self.env.clone(),
+            env: self.metadata.env.clone(),
             library_version: hello.library_version.clone(),
             rustc_version: hello.rustc_version.clone(),
             command: self.command.clone(),
-            session_name: self.session_name.clone(),
+            session_name: self.metadata.session_name.clone(),
             provider: self.provider.clone(),
             early_flake_detection: self.early_flake_detection,
             test_management: self.test_management,
             common: self.common.clone(),
         };
-        let Some(run) = nextest::join(hello, &self.module, &self.repo_root, &self.runtime_id, context) else {
+        let Some(run) = nextest::join(
+            hello,
+            &self.module,
+            &self.repo_root,
+            &self.metadata.runtime_id,
+            self.start,
+            context,
+        ) else {
             return;
         };
         self.working_directory = run.working_directory().to_string();
@@ -325,7 +325,8 @@ impl AgentSession {
                 })
                 .collect();
             let faulty = finish.is_some_and(|f| f.efd_faulty);
-            self.finalizer = Some(run.finish(end, suites, finish.is_some(), faulty));
+            self.finalizer
+                .set(Some(run.finish(end, suites, finish.is_some(), faulty)));
             return;
         }
         let complete = finish.is_some();
@@ -380,17 +381,18 @@ impl AgentSession {
     }
 
     /// Leaves a `cargo nextest run` without reporting this process, so the run
-    /// does not count it as an unfinished test.
+    /// does not count it as an unfinished test. The finalizer of the run keeps
+    /// its role, so the run is still reported.
     pub fn cancel(&mut self) {
         if let Some(run) = self.run.take() {
-            run.withdraw();
+            self.finalizer.set(run.withdraw());
         }
     }
 
     /// Flushes telemetry, then reports the run when this process has to. Runs
     /// after the test binary was told its results are delivered, so a slow
     /// telemetry endpoint or upload does not hold it up.
-    pub fn close(&mut self) {
+    pub fn close(&self) {
         if let Some(t) = &self.telemetry {
             t.stop();
         }
@@ -452,11 +454,11 @@ pub(crate) fn upload(
     telemetry: Option<&Telemetry>,
     metadata: &Metadata,
     spans: &[Span],
-) -> bool {
-    let Some(transport) = transport else { return false };
+) {
+    let Some(transport) = transport else { return };
     if transport.is_unreachable(Intake::TestCycle) {
         debug!("dropped {} events, Datadog is unreachable", spans.len());
-        return false;
+        return;
     }
     let payload = encode_payload(metadata, spans);
     let started = Instant::now();
@@ -487,14 +489,8 @@ pub(crate) fn upload(
         }
     }
     match result {
-        Ok(_) => {
-            debug!("sent {} events ({} bytes)", spans.len(), payload.len());
-            true
-        }
-        Err(error) => {
-            warn!("could not send test results to Datadog: {error}");
-            false
-        }
+        Ok(_) => debug!("sent {} events ({} bytes)", spans.len(), payload.len()),
+        Err(error) => warn!("could not send test results to Datadog: {error}"),
     }
 }
 
