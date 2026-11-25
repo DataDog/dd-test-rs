@@ -25,6 +25,9 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable ${{ matrix.toolchain }} --profile minimal --no-self-update
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-nextest@0.9.143
       # The wrapper and agent build on stable (MSRV 1.88). The end-to-end test
       # builds fixtures/basic, and with it the harness, on the matrix toolchain.
       - run: cargo +stable test --workspace --locked

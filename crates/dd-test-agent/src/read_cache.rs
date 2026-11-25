@@ -385,7 +385,7 @@ fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
 /// The open guard file, locked until it is dropped, or `None` when another
 /// agent holds it.
 #[cfg(unix)]
-fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
+pub(crate) fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new()
@@ -406,7 +406,7 @@ fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
 }
 
 #[cfg(not(unix))]
-fn takeover_guard(_path: &Path) -> std::io::Result<Option<File>> {
+pub(crate) fn takeover_guard(_path: &Path) -> std::io::Result<Option<File>> {
     Err(ErrorKind::Unsupported.into())
 }
 
@@ -457,7 +457,7 @@ fn release(path: &Path, lock: &Lock) {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -468,7 +468,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
-fn create_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

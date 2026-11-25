@@ -6,6 +6,7 @@ use crate::ci::{self, ProcessEnv, Tags};
 use crate::config::Config;
 use crate::event::{encode_payload, Kind, Metadata, Span};
 use crate::ids::{new_id, now_nanos};
+use crate::nextest;
 use crate::read_cache::{self, ReadCache, Scope};
 use crate::telemetry::{self, Telemetry};
 use crate::transport::{Intake, Transport};
@@ -22,17 +23,17 @@ use std::time::Instant;
 pub const FRAMEWORK: &str = "libtest";
 const DEFAULT_ATTEMPT_TO_FIX_RETRIES: u32 = 20;
 const EVENT_TAGS: [&str; 2] = ["test_framework:libtest", "event_type:test"];
-const INCOMPLETE_MESSAGE: &str = "The test binary exited before reporting all results";
+pub(crate) const INCOMPLETE_MESSAGE: &str = "The test binary exited before reporting all results";
 
 #[derive(Default)]
-struct Counts {
+pub(crate) struct Counts {
     passed: usize,
     failed: usize,
     skipped: usize,
 }
 
 impl Counts {
-    fn add(&mut self, status: Status) {
+    pub(crate) fn add(&mut self, status: Status) {
         match status {
             Status::Pass => self.passed += 1,
             Status::Fail => self.failed += 1,
@@ -40,7 +41,7 @@ impl Counts {
         }
     }
 
-    fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         if self.failed > 0 {
             Status::Fail
         } else if self.passed > 0 {
@@ -59,14 +60,16 @@ struct SuiteState {
     counts: Counts,
 }
 
-/// One test session: one test binary.
+/// One test session: one test binary, or the run of a `cargo nextest run`.
 pub struct AgentSession {
     uploader: Uploader,
     telemetry: Option<Arc<Telemetry>>,
     provider: String,
     service: String,
+    env: String,
     module: String,
     command: String,
+    session_name: String,
     working_directory: String,
     common: Tags,
     session_id: u64,
@@ -76,6 +79,7 @@ pub struct AgentSession {
     test_management: bool,
     suites: BTreeMap<String, SuiteState>,
     counts: Counts,
+    run: Option<nextest::Member>,
 }
 
 impl AgentSession {
@@ -178,11 +182,12 @@ impl AgentSession {
             .ok()
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| ".".to_string());
+        let session_name = session_name(config.session_name.as_deref(), &tags, &hello.command);
         let metadata = Metadata {
             runtime_id: format!("{:016x}{:016x}", new_id(), new_id()),
             library_version: hello.library_version.clone(),
-            env,
-            session_name: session_name(config.session_name.as_deref(), &tags, &hello.command),
+            env: env.clone(),
+            session_name: session_name.clone(),
         };
         let uploader = Uploader::start({
             let telemetry = telemetry.clone();
@@ -196,8 +201,10 @@ impl AgentSession {
                 .cloned()
                 .unwrap_or_else(|| "unsupported".to_string()),
             service,
+            env,
             module: hello.module.clone(),
             command: hello.command.clone(),
+            session_name,
             working_directory,
             common,
             session_id: new_id(),
@@ -207,8 +214,33 @@ impl AgentSession {
             test_management: bootstrap.test_management.is_some(),
             suites: BTreeMap::new(),
             counts: Counts::default(),
+            run: None,
         };
         (session, bootstrap)
+    }
+
+    /// Joins the `cargo nextest run` this binary is part of, when it is one, so
+    /// that the whole run is reported as one session. Runs after `Bootstrap`,
+    /// before any test is reported.
+    pub fn join_run(&mut self, hello: &Hello) {
+        let context = nextest::Context {
+            service: self.service.clone(),
+            env: self.env.clone(),
+            library_version: hello.library_version.clone(),
+            rustc_version: hello.rustc_version.clone(),
+            command: self.command.clone(),
+            session_name: self.session_name.clone(),
+            provider: self.provider.clone(),
+            early_flake_detection: self.early_flake_detection,
+            test_management: self.test_management,
+            common: self.common.clone(),
+        };
+        let Some(run) = nextest::join(hello, &self.module, &self.working_directory, context) else {
+            return;
+        };
+        self.session_id = run.session_id();
+        self.module_id = run.module_id();
+        self.run = Some(run);
     }
 
     pub fn record(&mut self, record: TestRecord) {
@@ -247,8 +279,12 @@ impl AgentSession {
         }
 
         let end = record.start + record.duration;
+        let suite_id = self.run.as_ref().map(|run| run.suite_id(&record.suite));
+        if let (Some(run), Some(outcome)) = (&mut self.run, record.outcome) {
+            run.observe(&record.suite, &record.name, outcome);
+        }
         let suite = self.suites.entry(record.suite).or_insert_with(|| SuiteState {
-            id: new_id(),
+            id: suite_id.unwrap_or_else(new_id),
             start: span.start,
             end,
             source_file: record.source_file,
@@ -265,8 +301,24 @@ impl AgentSession {
     }
 
     /// Reports suites, module and session, then sends everything. `None` means
-    /// the test binary exited without finishing, so the session fails.
-    pub fn finish(&mut self, finish: Option<Finish>) {
+    /// the test binary exited without finishing, so the session fails. Returns
+    /// the finalizer of a `cargo nextest run` when this process has to report
+    /// the run: the caller finishes it after releasing the test binary.
+    pub fn finish(&mut self, finish: Option<Finish>) -> Option<nextest::Finalizer> {
+        if let Some(run) = self.run.take() {
+            self.uploader.close();
+            let suites = std::mem::take(&mut self.suites)
+                .into_iter()
+                .map(|(name, suite)| nextest::SuiteEntry {
+                    name,
+                    start: suite.start,
+                    end: suite.end,
+                    source_file: suite.source_file,
+                })
+                .collect();
+            let faulty = finish.is_some_and(|f| f.efd_faulty);
+            return Some(run.finish(suites, finish.is_some(), faulty));
+        }
         let end = now_nanos();
         let complete = finish.is_some();
         let status = if complete { self.counts.status() } else { Status::Fail };
@@ -282,7 +334,7 @@ impl AgentSession {
             }
             set_status(&mut span, suite.counts.status());
             self.uploader.send(span);
-            self.container_events("event_type:suite", false);
+            container_events(self.telemetry.as_deref(), "event_type:suite", false);
         }
         for (kind, name, resource) in [
             (
@@ -302,30 +354,22 @@ impl AgentSession {
             if !complete {
                 span.set("error.message", INCOMPLETE_MESSAGE);
             }
-            span.set("test.itr.tests_skipping.enabled", "false");
-            span.set("test.code_coverage.enabled", "false");
-            if self.early_flake_detection {
-                span.set("test.early_flake.enabled", "true");
-                if finish.is_some_and(|f| f.efd_faulty) {
-                    span.set("test.early_flake.abort_reason", "faulty");
-                }
-            }
-            if self.test_management {
-                span.set("test.test_management.enabled", "true");
-            }
+            let faulty = finish.is_some_and(|f| f.efd_faulty);
+            set_container_tags(&mut span, self.early_flake_detection, faulty, self.test_management);
             self.uploader.send(span);
             let event_type = if kind == Kind::Module {
                 "event_type:module"
             } else {
                 "event_type:session"
             };
-            self.container_events(event_type, finish.is_some_and(|f| f.efd_faulty));
+            container_events(self.telemetry.as_deref(), event_type, faulty);
         }
         if let Some(t) = &self.telemetry {
             let provider = format!("provider:{}", self.provider);
             t.count("test_session", &[provider.as_str()]);
         }
         self.uploader.close();
+        None
     }
 
     /// Flushes telemetry. Runs after the test binary was told its results are
@@ -333,17 +377,6 @@ impl AgentSession {
     pub fn close(&self) {
         if let Some(t) = &self.telemetry {
             t.stop();
-        }
-    }
-
-    fn container_events(&self, event_type: &str, efd_faulty: bool) {
-        if let Some(t) = &self.telemetry {
-            t.count("event_created", &["test_framework:libtest", event_type]);
-            let mut tags = vec!["test_framework:libtest", event_type];
-            if efd_faulty && event_type == "event_type:session" {
-                tags.push("early_flake_detection_abort_reason:faulty");
-            }
-            t.count("event_finished", &tags);
         }
     }
 
@@ -361,7 +394,37 @@ impl AgentSession {
     }
 }
 
-fn upload(transport: Option<&Transport>, telemetry: Option<&Telemetry>, metadata: &Metadata, spans: &[Span]) {
+pub(crate) fn container_events(telemetry: Option<&Telemetry>, event_type: &str, efd_faulty: bool) {
+    let Some(t) = telemetry else { return };
+    t.count("event_created", &["test_framework:libtest", event_type]);
+    let mut tags = vec!["test_framework:libtest", event_type];
+    if efd_faulty && event_type == "event_type:session" {
+        tags.push("early_flake_detection_abort_reason:faulty");
+    }
+    t.count("event_finished", &tags);
+}
+
+/// The tags of suites, modules and sessions that do not depend on their status.
+pub(crate) fn set_container_tags(span: &mut Span, early_flake_detection: bool, faulty: bool, test_management: bool) {
+    span.set("test.itr.tests_skipping.enabled", "false");
+    span.set("test.code_coverage.enabled", "false");
+    if early_flake_detection {
+        span.set("test.early_flake.enabled", "true");
+        if faulty {
+            span.set("test.early_flake.abort_reason", "faulty");
+        }
+    }
+    if test_management {
+        span.set("test.test_management.enabled", "true");
+    }
+}
+
+pub(crate) fn upload(
+    transport: Option<&Transport>,
+    telemetry: Option<&Telemetry>,
+    metadata: &Metadata,
+    spans: &[Span],
+) {
     let Some(transport) = transport else { return };
     if transport.is_unreachable(Intake::TestCycle) {
         debug!("dropped {} events, Datadog is unreachable", spans.len());
@@ -434,7 +497,7 @@ fn session_name(configured: Option<&str>, tags: &Tags, command: &str) -> String 
     }
 }
 
-fn set_status(span: &mut Span, status: Status) {
+pub(crate) fn set_status(span: &mut Span, status: Status) {
     span.set("test.status", status.as_str());
     span.error = status == Status::Fail;
 }

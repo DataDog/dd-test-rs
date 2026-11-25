@@ -61,7 +61,7 @@ export DD_ENV=ci
 cargo test
 ```
 
-`cargo nextest run` works too, but reports each test as its own test session. See [cargo nextest](#cargo-nextest).
+`cargo nextest run` works too, and reports the whole run as one test session. See [cargo nextest](#cargo-nextest).
 
 `RUSTC_WORKSPACE_WRAPPER` accepts the name of a binary on your `PATH` or a full path. Use the [Datadog site](https://docs.datadoghq.com/getting_started/site/) of your organization for `DD_SITE`, such as `datadoghq.eu` or `us5.datadoghq.com`.
 
@@ -163,7 +163,7 @@ Each test binary is reported as a test session:
 
 | Datadog | Rust | Example |
 | --- | --- | --- |
-| Test session | one test binary | |
+| Test session | one test binary, or one `cargo nextest run` | |
 | Test module | Cargo package | `bytes` |
 | Test suite | crate name and module path | `bytes::bytes_mut::tests` |
 | Test | function name | `test_original_capacity_to_repr` |
@@ -176,13 +176,15 @@ Each test binary is reported as a test session:
 
 ### cargo nextest
 
-nextest runs each test in its own process, and each process is reported like a test binary. As a result:
+nextest runs each test in its own process. A `cargo nextest run` is reported as one test session, with one test module per package and one test suite per suite name.
 
-- Each test is reported as its own test session, with its own module and suite.
+- The first test process of a run sends the suite, module and session results after nextest exits, usually within a second. CI systems that stop leftover processes as soon as the command ends, such as some container executors, can drop them.
+- With `--retries`, each attempt is reported as its own test execution. Suites, modules and the session take the result of the last attempt.
 - `DD_CIVISIBILITY_TOTAL_FLAKY_RETRY_COUNT` limits the retries of each test, not of the whole run.
-- Early Flake Detection does not detect runs with too many new tests, because each process sees a single test.
+- Early Flake Detection does not detect runs with too many new tests.
+- nextest versions that do not set `NEXTEST_BINARY_ID` report each test as its own test session.
 
-Use `cargo test` to report one test session per test binary.
+With `DD_TRACE_DEBUG=true`, the run writes its debug log to `<read cache dir>/nextest/<run id>.log`.
 
 ### Limitations
 

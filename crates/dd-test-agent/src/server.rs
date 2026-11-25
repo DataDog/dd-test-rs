@@ -39,16 +39,20 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
     }
     let (mut session, bootstrap) = AgentSession::start(&hello, config);
     reply(&mut output, Message::Bootstrap(bootstrap));
+    session.join_run(&hello);
 
     for line in lines {
         let Ok(line) = line else { break };
         match Message::decode(&line) {
             Ok(Message::Test(record)) => session.record(record),
             Ok(Message::Finish(finish)) => {
-                session.finish(Some(finish));
+                let finalizer = session.finish(Some(finish));
                 detach_stderr();
                 reply(&mut output, Message::Finished);
                 session.close();
+                if let Some(finalizer) = finalizer {
+                    finalizer.run();
+                }
                 return 0;
             }
             Ok(Message::Cancel) => {
@@ -62,8 +66,11 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
         }
     }
     detach_stderr();
-    session.finish(None);
+    let finalizer = session.finish(None);
     session.close();
+    if let Some(finalizer) = finalizer {
+        finalizer.run();
+    }
     0
 }
 
