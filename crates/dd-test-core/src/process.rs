@@ -214,16 +214,28 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn reads_the_arguments_of_a_child_process() {
+        use std::io::{BufRead, BufReader, Write};
+
         let mut child = std::process::Command::new("cat")
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = child.id();
+        let mut stdin = child.stdin.take().unwrap();
+        writeln!(stdin, "cat has started").unwrap();
+        // The kernel fills in the child's cmdline only once exec is nearly done, and
+        // posix_spawn resumes the parent before that. cat echoing a line proves it runs.
+        let mut echo = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut echo)
+            .unwrap();
+        assert_eq!(echo, "cat has started\n");
         let native = command(pid);
         let ps = std::process::Command::new("ps")
             .args(["-o", "command=", "-p", &pid.to_string()])
             .output();
-        drop(child.stdin.take());
+        drop(stdin);
         child.wait().unwrap();
         let native = native.expect("the native lookup reads a child process");
         assert_eq!(native, "cat");
