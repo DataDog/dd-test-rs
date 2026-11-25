@@ -22,6 +22,7 @@ use crate::session::{self, Counts, INCOMPLETE_MESSAGE};
 use crate::telemetry::Telemetry;
 use crate::transport::Transport;
 use crate::uploader;
+use dd_test_core::engine::split_test_name;
 use dd_test_core::protocol::{Hello, Status};
 use dd_test_core::{debug, warn};
 use serde::{Deserialize, Serialize};
@@ -72,6 +73,7 @@ pub(crate) fn join(
     let root = read_cache::default_dir().join(NEXTEST);
     let session = SessionInfo {
         module: module.to_string(),
+        crate_name: hello.crate_name.clone(),
         working_directory,
         runtime_id: runtime_id.to_string(),
         start,
@@ -225,6 +227,7 @@ struct Journal {
 /// before the session.
 struct SessionInfo {
     module: String,
+    crate_name: String,
     working_directory: String,
     runtime_id: String,
     start: i64,
@@ -245,6 +248,8 @@ pub(crate) struct Member {
     attempt: u32,
     stress: Option<u64>,
     module: String,
+    /// The suite of the test this process runs, known before it reports.
+    suite: String,
     working_directory: String,
     pstart: u64,
     start: i64,
@@ -274,6 +279,7 @@ impl Member {
                 return None;
             }
         };
+        let suite = split_test_name(&session.crate_name, &run.test_name).0;
         let member = Member {
             session_id: derived_id(&[&run.run_id, "session"]),
             module_id: derived_id(&[&run.run_id, "module", &session.module]),
@@ -289,6 +295,7 @@ impl Member {
             attempt: run.attempt,
             stress: run.stress,
             module: session.module,
+            suite,
             working_directory: session.working_directory,
             pstart: process_info(std::process::id()).map_or(0, |info| info.start),
             start: session.start,
@@ -343,6 +350,10 @@ impl Member {
         journal.complete = complete;
         journal.efd_faulty = efd_faulty;
         journal.suites = suites;
+        if !complete && !journal.suites.iter().any(|suite| suite.name == self.suite) {
+            // The process did not report what it ran, so the suite it was about to run still counts.
+            journal.suites.push(self.suite_entry(end));
+        }
         journal.tests = std::mem::take(&mut self.tests);
         let started = Instant::now();
         match write_json(&self.marker, &journal) {
@@ -409,8 +420,17 @@ impl Member {
             early_flake_detection: self.context.early_flake_detection,
             efd_faulty: false,
             test_management: self.context.test_management,
-            suites: Vec::new(),
+            suites: vec![self.suite_entry(self.start)],
             tests: Vec::new(),
+        }
+    }
+
+    fn suite_entry(&self, end: i64) -> SuiteEntry {
+        SuiteEntry {
+            name: self.suite.clone(),
+            start: self.start,
+            end,
+            source_file: None,
         }
     }
 }
@@ -1315,7 +1335,7 @@ mod tests {
         RunEnv {
             run_id: run_id.to_string(),
             binary_id: "fixture::integration".to_string(),
-            test_name: "integration::adds".to_string(),
+            test_name: "adds".to_string(),
             attempt: 1,
             stress: None,
         }
@@ -1339,6 +1359,7 @@ mod tests {
     fn session_info(start: i64) -> SessionInfo {
         SessionInfo {
             module: "fixture".to_string(),
+            crate_name: "integration".to_string(),
             working_directory: "fixtures/basic".to_string(),
             runtime_id: "0123456789abcdef".to_string(),
             start,
@@ -1513,6 +1534,23 @@ mod tests {
         assert_eq!(status_of(&folded, Some("fixture"), Some("integration")), Status::Fail);
         assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
         assert_eq!(status_of(&folded, None, None), Status::Fail);
+    }
+
+    #[test]
+    fn a_process_killed_before_it_reports_fails_the_suite_it_was_about_to_run() {
+        let dir = temp_dir("killed-suite");
+        let killed = join_in(&dir).unwrap();
+        let dir_path = killed.dir.clone();
+        // Killed before it reported a test, so only the marker written at join is left.
+        drop(killed);
+        let passed = journal("fixture", "integration", "passes", Some(Status::Pass));
+        write_json(&dir_path.join("j-passed.json"), &passed).unwrap();
+
+        let folded = fold_run(&read_journals(&dir_path));
+        assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
+        assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
+        assert_eq!(status_of(&folded, None, None), Status::Fail);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
