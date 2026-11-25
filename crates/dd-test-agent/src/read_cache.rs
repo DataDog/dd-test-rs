@@ -584,6 +584,13 @@ mod tests {
     }
 
     #[test]
+    fn does_not_share_between_configurations() {
+        let cache = cache(&temp_dir("configurations"));
+        let body = |version: &str| json!({"data": {"attributes": {"configurations": {"os.version": version}}}});
+        assert_ne!(cache.key("/p", &body("1.0")), cache.key("/p", &body("2.0")));
+    }
+
+    #[test]
     fn does_not_store_failures() {
         let dir = temp_dir("failures");
         let cache = cache(&dir);

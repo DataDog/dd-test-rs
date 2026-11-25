@@ -16,4 +16,5 @@ pub mod env;
 pub mod ids;
 pub mod json;
 pub mod panic;
+pub mod process;
 pub mod protocol;
