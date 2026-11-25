@@ -413,12 +413,17 @@ fn ensure_time_disables_retries_and_report_time_keeps_them() {
 
 #[test]
 fn nextest_reports_one_session_for_the_run() {
-    let installed = cargo()
-        .args(["nextest", "--version"])
-        .output()
-        .is_ok_and(|output| output.status.success());
-    if !installed {
-        eprintln!("skipping nextest_reports_one_session_for_the_run: cargo-nextest is not installed");
+    let version = cargo().args(["nextest", "--version"]).output();
+    if !version.as_ref().is_ok_and(|output| output.status.success()) {
+        let reason = match &version {
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "cargo-nextest must be installed in CI: {reason}"
+        );
+        eprintln!("skipping nextest_reports_one_session_for_the_run: cargo-nextest is not installed: {reason}");
         return;
     }
     let run = run_fixture(

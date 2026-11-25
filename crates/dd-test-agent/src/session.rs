@@ -188,7 +188,9 @@ impl AgentSession {
         let uploader = Uploader::start({
             let telemetry = telemetry.clone();
             let metadata = metadata.clone();
-            move |spans| upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans)
+            move |spans| {
+                upload(transport.as_ref(), telemetry.as_deref(), &metadata, &spans);
+            }
         });
         let session = AgentSession {
             uploader,
@@ -287,7 +289,7 @@ impl AgentSession {
         let end = record.start + record.duration;
         let suite_id = self.run.as_ref().map(|run| run.suite_id(&record.suite));
         if let (Some(run), Some(outcome)) = (&mut self.run, record.outcome) {
-            run.observe(&record.suite, &record.name, outcome);
+            run.observe(&record.suite, outcome);
         }
         let suite = self.suites.entry(record.suite).or_insert_with(|| SuiteState {
             id: suite_id.unwrap_or_else(new_id),
@@ -382,10 +384,10 @@ impl AgentSession {
 
     /// Leaves a `cargo nextest run` without reporting this process, so the run
     /// does not count it as an unfinished test. The finalizer of the run keeps
-    /// its role, so the run is still reported.
+    /// its role, and this process takes it over when it is gone.
     pub fn cancel(&mut self) {
         if let Some(run) = self.run.take() {
-            self.finalizer.set(run.withdraw());
+            self.finalizer.set(Some(run.withdraw()));
         }
     }
 
@@ -454,11 +456,11 @@ pub(crate) fn upload(
     telemetry: Option<&Telemetry>,
     metadata: &Metadata,
     spans: &[Span],
-) {
-    let Some(transport) = transport else { return };
+) -> usize {
+    let Some(transport) = transport else { return 0 };
     if transport.is_unreachable(Intake::TestCycle) {
         debug!("dropped {} events, Datadog is unreachable", spans.len());
-        return;
+        return 0;
     }
     let payload = encode_payload(metadata, spans);
     let started = Instant::now();
@@ -489,8 +491,14 @@ pub(crate) fn upload(
         }
     }
     match result {
-        Ok(_) => debug!("sent {} events ({} bytes)", spans.len(), payload.len()),
-        Err(error) => warn!("could not send test results to Datadog: {error}"),
+        Ok(_) => {
+            debug!("sent {} events ({} bytes)", spans.len(), payload.len());
+            spans.len()
+        }
+        Err(error) => {
+            warn!("could not send test results to Datadog: {error}");
+            0
+        }
     }
 }
 

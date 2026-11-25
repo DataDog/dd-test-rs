@@ -159,7 +159,7 @@ Git metadata comes from your CI provider and from the local checkout. Use these 
 
 ## What is supported
 
-Each test binary is reported as a test session:
+Each test binary is reported as a test session. So is a whole `cargo nextest run`:
 
 | Datadog | Rust | Example |
 | --- | --- | --- |
@@ -178,7 +178,7 @@ Each test binary is reported as a test session:
 
 nextest runs each test in its own process. A `cargo nextest run` is reported as one test session, with one test module per package and one test suite per suite name.
 
-- The first test process of a run sends the suite, module and session results after nextest exits, usually within a second. CI systems that stop leftover processes as soon as the command ends, such as some container executors, can drop them.
+- One test process of the run, not necessarily the first, sends the suite, module and session results after nextest exits, usually within a second. CI systems that stop leftover processes as soon as the command ends, such as some container executors, can drop them.
 - With `--retries`, each attempt is reported as its own test execution. Suites, modules and the session take the result of the last attempt.
 - `DD_CIVISIBILITY_TOTAL_FLAKY_RETRY_COUNT` limits the retries of each test, not of the whole run.
 - Early Flake Detection does not detect runs with too many new tests.

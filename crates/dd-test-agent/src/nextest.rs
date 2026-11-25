@@ -27,6 +27,7 @@ use dd_test_core::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -178,7 +179,6 @@ pub(crate) struct SuiteEntry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct TestEntry {
     suite: String,
-    name: String,
     status: String,
 }
 
@@ -187,6 +187,13 @@ struct TestEntry {
 enum State {
     Running,
     Done,
+}
+
+/// The version of a journal, read alone so that a journal of another version
+/// never has to read into this schema.
+#[derive(Deserialize)]
+struct JournalVersion {
+    v: u32,
 }
 
 /// What one test process reported. A running journal is the marker that keeps
@@ -319,10 +326,9 @@ impl Member {
         derived_id(&[&self.run_id, "suite", &self.module, suite])
     }
 
-    pub(crate) fn observe(&mut self, suite: &str, name: &str, status: Status) {
+    pub(crate) fn observe(&mut self, suite: &str, status: Status) {
         self.tests.push(TestEntry {
             suite: suite.to_string(),
-            name: name.to_string(),
             status: status.as_str().to_string(),
         });
     }
@@ -355,15 +361,14 @@ impl Member {
     }
 
     /// Leaves the run without reporting anything: the process exits before the
-    /// tests finish, so its journal must not count as incomplete. A member
-    /// leaves the run to another process of the run, while the finalizer keeps
-    /// it and reports the run from `close`.
-    pub(crate) fn withdraw(self) -> Option<Finalizer> {
+    /// tests finish, so its journal must not count as incomplete. The finalizer
+    /// keeps the run, and a member takes it over when the finalizer of the run
+    /// is gone, so that the journals of the run are reported either way.
+    pub(crate) fn withdraw(self) -> Finalizer {
         if let Err(error) = std::fs::remove_file(&self.marker) {
             debug!("nextest: could not withdraw the marker: {error}");
         }
-        self.lock.as_ref()?;
-        Some(self.finalizer())
+        self.finalizer()
     }
 
     fn finalizer(self) -> Finalizer {
@@ -513,11 +518,12 @@ impl Finalizer {
             session_name: context.session_name.clone(),
         };
         let batches = batches(&metadata, &spans);
+        let mut sent = 0;
         for batch in &batches {
-            session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, batch);
+            sent += session::upload(transport.as_ref(), telemetry.as_ref(), &metadata, batch);
         }
         debug!(
-            "nextest: sent {} container events in {} batches",
+            "nextest: sent {sent} of {} container events in {} batches",
             spans.len(),
             batches.len()
         );
@@ -556,16 +562,31 @@ fn gather(dir: &Path, runner: Option<ProcessId>, limits: &Limits) -> Vec<Journal
         .map(|(_, journal)| journal.clone())
         .collect();
     drain(&running, limits);
-    // A process that wrote its journal while the finalizer waited would
-    // otherwise count as incomplete.
-    for (path, journal) in &mut entries {
-        if writing(journal) {
-            if let Some(latest) = read_journal(path) {
+    reread(&mut entries);
+    entries.into_iter().map(|(_, journal)| journal).collect()
+}
+
+/// Reads again the journals of the processes that were still writing when the
+/// finalizer read the directory. One that wrote its journal during the drain
+/// would otherwise count as incomplete, and one that withdrew has nothing to
+/// report.
+fn reread(entries: &mut Vec<(PathBuf, Journal)>) {
+    entries.retain_mut(|(path, journal)| {
+        if !writing(journal) {
+            return true;
+        }
+        match read_journal(path) {
+            Ok(Some(latest)) => {
                 *journal = latest;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                debug!("nextest: could not read {} again: {error}", path.display());
+                true
             }
         }
-    }
-    entries.into_iter().map(|(_, journal)| journal).collect()
+    });
 }
 
 fn wait_for_runner(runner: Option<ProcessId>, limits: &Limits) {
@@ -640,21 +661,80 @@ fn read_entries(dir: &Path) -> Vec<(PathBuf, Journal)> {
             continue;
         }
         match read_journal(&entry.path()) {
-            Some(journal) => journals.push((entry.path(), journal)),
-            None => debug!("nextest: unreadable journal {}", entry.path().display()),
+            Ok(Some(journal)) => journals.push((entry.path(), journal)),
+            Ok(None) => {}
+            Err(error) => {
+                debug!("nextest: could not read {}: {error}", entry.path().display());
+                journals.push((entry.path(), unreadable_journal()));
+            }
         }
     }
     journals
 }
 
-fn read_journal(path: &Path) -> Option<Journal> {
-    let bytes = std::fs::read(path).ok()?;
-    let mut journal: Journal = serde_json::from_slice(&bytes).ok()?;
-    if journal.v != JOURNAL_VERSION {
-        debug!("nextest: journal version {} at {}", journal.v, path.display());
-        journal.complete = false;
+/// The journal at `path`, or `None` when the file is gone, which is how a
+/// process withdraws after a cancel.
+fn read_journal(path: &Path) -> std::io::Result<Option<Journal>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    // The version alone first: a journal of another version may not read into
+    // this schema, and its results cannot be trusted either way.
+    let version = match serde_json::from_slice::<JournalVersion>(&bytes) {
+        Ok(version) => version,
+        Err(error) => {
+            debug!(
+                "nextest: unreadable journal {}: {error}, its process counts as incomplete",
+                path.display()
+            );
+            return Ok(Some(unreadable_journal()));
+        }
+    };
+    if version.v != JOURNAL_VERSION {
+        debug!(
+            "nextest: journal version {} at {}, its process counts as incomplete",
+            version.v,
+            path.display()
+        );
+        return Ok(Some(unreadable_journal()));
     }
-    Some(journal)
+    match serde_json::from_slice(&bytes) {
+        Ok(journal) => Ok(Some(journal)),
+        Err(error) => {
+            debug!(
+                "nextest: unreadable journal {}: {error}, its process counts as incomplete",
+                path.display()
+            );
+            Ok(Some(unreadable_journal()))
+        }
+    }
+}
+
+/// The journal of a process whose results could not be read: it reported in,
+/// though not which module it belongs to, and did not finish.
+fn unreadable_journal() -> Journal {
+    Journal {
+        v: JOURNAL_VERSION,
+        state: State::Done,
+        pid: 0,
+        pstart: 0,
+        binary_id: String::new(),
+        test_name: String::new(),
+        attempt: 0,
+        stress: None,
+        module: String::new(),
+        working_directory: String::new(),
+        start: 0,
+        end: 0,
+        complete: false,
+        early_flake_detection: false,
+        efd_faulty: false,
+        test_management: false,
+        suites: Vec::new(),
+        tests: Vec::new(),
+    }
 }
 
 fn read_context(dir: &Path) -> Option<Context> {
@@ -832,7 +912,10 @@ fn fold(journals: &[Journal]) -> Folded {
     let mut range: Option<(i64, i64)> = None;
     let mut modules: BTreeMap<String, FoldedContainer> = BTreeMap::new();
     let mut suites: BTreeMap<(&str, &str), FoldedSuite> = BTreeMap::new();
-    for journal in journals {
+    // A journal the finalizer could not read names no module and no time: its
+    // process still fails the session.
+    session.incomplete |= journals.iter().any(|journal| journal.module.is_empty());
+    for journal in journals.iter().filter(|journal| !journal.module.is_empty()) {
         let (start, end) = range.unwrap_or((journal.start, journal.end));
         range = Some((start.min(journal.start), end.max(journal.end)));
         session.early_flake_detection |= journal.early_flake_detection;
@@ -890,11 +973,20 @@ fn fold(journals: &[Journal]) -> Folded {
         }
     }
 
-    // A test whose last attempt was killed reported no outcome of its own. It
-    // still failed in the suites of its earlier attempts, which would otherwise
-    // count as skipped while their module and the session fail.
+    // A process that did not finish fails the suites it reported, which would
+    // otherwise count as skipped while their module and the session fail.
+    // A test whose last attempt was killed reported no outcome of its own, so
+    // the suites of its earlier attempts fail too.
     for (key, journal) in &kept {
-        if journal.complete || !journal.tests.is_empty() {
+        if journal.complete {
+            continue;
+        }
+        for suite in &journal.suites {
+            if let Some(folded) = suites.get_mut(&(journal.module.as_str(), suite.name.as_str())) {
+                folded.counts.add(Status::Fail);
+            }
+        }
+        if !journal.tests.is_empty() {
             continue;
         }
         for earlier in journals
@@ -1255,7 +1347,6 @@ mod tests {
             tests: status
                 .map(|status| TestEntry {
                     suite: suite.to_string(),
-                    name: test.to_string(),
                     status: status.as_str().to_string(),
                 })
                 .into_iter()
@@ -1362,6 +1453,19 @@ mod tests {
         assert!(folded.session.incomplete);
         assert_eq!(status_of(&folded, Some("other"), None), Status::Pass);
         assert_eq!(folded.session.start, 5, "the killed process starts the session");
+    }
+
+    #[test]
+    fn an_incomplete_process_fails_the_suites_it_reported() {
+        // An Early Flake Detection execution reported an intermediate event, so
+        // its journal lists the suite, and the process was killed before it
+        // reported any outcome.
+        let killed = journal("fixture", "integration", "adds", None);
+        assert!(killed.tests.is_empty(), "the process reported no outcome");
+        let folded = fold(&[killed]);
+        assert_eq!(status_of(&folded, Some("fixture"), Some("integration")), Status::Fail);
+        assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
+        assert_eq!(status_of(&folded, None, None), Status::Fail);
     }
 
     #[test]
@@ -1484,14 +1588,44 @@ mod tests {
         let member = join_in(&dir).unwrap();
         let marker = member.marker.clone();
         let dir_path = elected.dir.clone();
-        assert!(member.withdraw().is_none(), "only the finalizer reports the run");
+        let withdrawn = member.withdraw();
+        assert!(withdrawn.lock.is_none(), "the elected agent keeps the run");
         assert!(!marker.exists(), "a process that reports nothing leaves no marker");
+        assert!(
+            withdrawn.take_over().is_none(),
+            "the elected agent reports the run while it lives"
+        );
 
         let finalizer = elected.finish(1, Vec::new(), true, false);
         let journals = read_journals(&dir_path);
         assert_eq!(journals.len(), 1, "only the process that reported counts");
         assert!(!fold(&journals).session.incomplete);
         drop(finalizer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_member_takes_over_the_run_when_the_elected_agent_is_gone() {
+        let dir = temp_dir("cancel-takeover");
+        let elected = join_in(&dir).unwrap();
+        let member = join_in(&dir).unwrap();
+        let dir_path = elected.dir.clone();
+
+        // The elected agent wrote its journal, then died before it could report
+        // the run.
+        drop(elected.finish(1, Vec::new(), true, false));
+        let marker = member.marker.clone();
+        let finalizer = member.withdraw();
+        assert!(!marker.exists(), "a cancelled member reports nothing of its own");
+        eventually(|| finalizer.take_over());
+
+        let journals = gather(
+            &dir_path,
+            None,
+            &limits(Duration::from_secs(10), Duration::from_millis(100)),
+        );
+        assert_eq!(journals.len(), 1, "the journal of the run is not stranded");
+        assert!(!fold(&journals).session.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1507,9 +1641,7 @@ mod tests {
         let finished = member.finish(2, Vec::new(), true, false);
         assert!(finished.take_over().is_none());
 
-        let finalizer = elected
-            .withdraw()
-            .expect("the elected agent keeps the run when its test binary cancels");
+        let finalizer = elected.withdraw();
         assert!(!marker.exists());
         assert!(
             read_cache::existing_guard(&dir_path.join(LOCK)).unwrap().is_none(),
@@ -1578,7 +1710,23 @@ mod tests {
         write_json(&dir.join("j-next.json"), &written).unwrap();
 
         let journals = read_journals(&dir);
-        assert_eq!(journals.len(), 1);
+        assert_eq!(journals.len(), 1, "the process of another version is not skipped");
+        assert!(!journals[0].complete);
+        assert!(
+            journals[0].tests.is_empty(),
+            "the results of another version are not trusted"
+        );
+        assert!(fold(&journals).session.incomplete);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_journal_counts_as_incomplete() {
+        let dir = temp_dir("unreadable");
+        std::fs::write(dir.join("j-broken.json"), b"{\"v\":1,").unwrap();
+
+        let journals = read_journals(&dir);
+        assert_eq!(journals.len(), 1, "the process is not skipped");
         assert!(!journals[0].complete);
         assert!(fold(&journals).session.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1777,40 +1925,61 @@ mod tests {
     #[test]
     fn rereads_a_marker_that_finished_during_the_drain() {
         let dir = temp_dir("reread");
-        let (mut child, id, stdin) = blocking_runner();
-        let id = id.unwrap();
         let mut marker = journal("fixture", "integration", "adds", None);
         marker.state = State::Running;
-        marker.pid = id.pid;
-        marker.pstart = id.start;
         let path = dir.join("j-live.json");
         write_json(&path, &marker).unwrap();
 
-        let gathering = dir.clone();
-        let gathered = waiting(move || {
-            gather(
-                &gathering,
-                None,
-                &limits(Duration::from_secs(10), Duration::from_secs(10)),
-            )
-        });
-        assert!(
-            gathered.recv_timeout(Duration::from_millis(100)).is_err(),
-            "the finalizer waits for the process that was writing"
-        );
-
-        // The process writes its journal while the finalizer waits, then exits.
+        // The finalizer reads the directory, then the process writes its
+        // journal and exits.
+        let mut entries = read_entries(&dir);
+        assert_eq!(entries.len(), 1);
+        assert!(writing(&entries[0].1), "the process was still writing");
         write_json(&path, &journal("fixture", "integration", "adds", Some(Status::Pass))).unwrap();
-        drop(stdin);
+        reread(&mut entries);
 
-        let journals = gathered.recv_timeout(Duration::from_secs(30)).unwrap();
-        child.wait().unwrap();
+        let journals: Vec<Journal> = entries.into_iter().map(|(_, journal)| journal).collect();
+        assert_eq!(journals.len(), 1);
         let folded = fold(&journals);
         assert!(
             !folded.session.incomplete,
             "the journal written during the drain counts"
         );
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_withdrew_during_the_drain_is_dropped() {
+        let dir = temp_dir("withdrawn");
+        let mut marker = journal("fixture", "integration", "adds", None);
+        marker.state = State::Running;
+        let path = dir.join("j-live.json");
+        write_json(&path, &marker).unwrap();
+
+        let mut entries = read_entries(&dir);
+        std::fs::remove_file(&path).unwrap();
+        reread(&mut entries);
+
+        assert!(entries.is_empty(), "a process that withdrew reports nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_again_counts_as_incomplete() {
+        let dir = temp_dir("reread-error");
+        let mut marker = journal("fixture", "integration", "adds", None);
+        marker.state = State::Running;
+        // Reading a directory fails with an error other than a missing file.
+        let path = dir.join("j-live.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let mut entries = vec![(path, marker)];
+        reread(&mut entries);
+
+        assert_eq!(entries.len(), 1, "a process that cannot be read stays incomplete");
+        let journals: Vec<Journal> = entries.into_iter().map(|(_, journal)| journal).collect();
+        assert!(fold(&journals).session.incomplete);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
