@@ -16,7 +16,7 @@
 
 use crate::config::Config;
 use crate::event::{encode_payload, Kind, Metadata, Span};
-use crate::ids::new_id;
+use crate::ids::{new_id, now_nanos};
 use crate::read_cache;
 use crate::session::{self, Counts, INCOMPLETE_MESSAGE};
 use crate::telemetry::Telemetry;
@@ -513,6 +513,7 @@ impl Finalizer {
     fn own(&self) -> OwnSession<'_> {
         OwnSession {
             start: self.start,
+            end: now_nanos(),
             working_directory: &self.working_directory,
         }
     }
@@ -632,18 +633,28 @@ fn reread(entries: &mut Vec<(PathBuf, Journal)>) {
     });
 }
 
-/// Waits for nextest to exit and reports how the finalizer learned it, so the
-/// debug log and the tests can tell an exit event from a poll.
-fn wait_for_runner(runner: ProcessId, limits: &Limits) -> &'static str {
+/// Whether nextest exited within the wait, and how the finalizer learned it, so
+/// the debug log and the tests can tell an exit event from a poll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waited {
+    exited: bool,
+    via: &'static str,
+}
+
+/// Waits for nextest to exit.
+fn wait_for_runner(runner: ProcessId, limits: &Limits) -> Waited {
     let started = Instant::now();
-    let event = (limits.watch)(runner.pid);
-    let via = match &event {
-        Some(_) => exit_event::VIA,
-        None => "poll",
-    };
+    let mut event = (limits.watch)(runner.pid);
     // The identity is checked once the handle exists: a pid that exits and is
     // reused in between would otherwise be watched in place of the runner.
     let mut exited = !runner.alive();
+    let mut via = if exited {
+        "gone"
+    } else if event.is_some() {
+        exit_event::VIA
+    } else {
+        "poll"
+    };
     while !exited {
         let left = limits.runner_wait.saturating_sub(started.elapsed());
         if left.is_zero() {
@@ -651,39 +662,63 @@ fn wait_for_runner(runner: ProcessId, limits: &Limits) -> &'static str {
                 "nextest: runner still running after {:?}, reporting what there is",
                 limits.runner_wait
             );
-            return via;
+            return Waited { exited, via };
         }
-        let reported = match &event {
-            Some(event) => event.wait(left),
-            None => {
-                std::thread::sleep(limits.poll);
-                false
-            }
-        };
-        exited = reported || !runner.alive();
+        match &event {
+            Some(watched) => match watched.wait(left) {
+                Exit::Exited => exited = true,
+                Exit::TimedOut => {}
+                // The handle stays broken, so waiting on it again would report
+                // nothing until the deadline.
+                Exit::Failed => {
+                    debug!("nextest: no exit event for the runner, polling for its exit instead");
+                    event = None;
+                    via = "poll";
+                }
+            },
+            None => std::thread::sleep(left.min(limits.poll)),
+        }
+        exited |= !runner.alive();
     }
     debug!(
         "nextest: runner exited after {} us via:{via}",
         started.elapsed().as_micros()
     );
-    via
+    Waited { exited, via }
+}
+
+/// How a wait on the exit of a process ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exit {
+    Exited,
+    /// The process was still running when the wait ran out of time.
+    TimedOut,
+    /// The handle cannot report the exit, so the caller polls instead.
+    Failed,
 }
 
 /// The exit of a process, reported by the kernel instead of polled, so the
 /// finalizer can send the run as soon as nextest is gone.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exit_event {
-    use std::io::{Error, Result};
+    use super::Exit;
+    use std::io::{Error, ErrorKind, Result};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::time::Duration;
+    #[cfg(test)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     #[cfg(target_os = "linux")]
     pub(super) const VIA: &str = "pidfd";
     #[cfg(target_os = "macos")]
     pub(super) const VIA: &str = "kqueue";
 
-    pub(super) struct ExitEvent {
-        fd: OwnedFd,
+    pub(super) enum ExitEvent {
+        Fd(OwnedFd),
+        /// A handle whose waits fail, which the tests use to reach the polling
+        /// path.
+        #[cfg(test)]
+        Failing(&'static AtomicUsize),
     }
 
     /// The handle that reports the exit of `pid`, or `None` when the kernel
@@ -693,18 +728,26 @@ mod exit_event {
     }
 
     impl ExitEvent {
+        /// A handle whose waits fail and count themselves, so a test can check
+        /// that the caller polls instead of spinning.
+        #[cfg(test)]
+        pub(super) fn failing(waits: &'static AtomicUsize) -> ExitEvent {
+            ExitEvent::Failing(waits)
+        }
+
         #[cfg(target_os = "linux")]
         fn new(pid: u32) -> Result<ExitEvent> {
-            let pid = libc::pid_t::try_from(pid).map_err(|_| Error::from(std::io::ErrorKind::InvalidInput))?;
-            // SAFETY: pidfd_open takes a pid and a flags word, both `c_long`,
-            // and returns a new descriptor, or -1 with the error in errno.
+            let pid = libc::pid_t::try_from(pid).map_err(|_| Error::from(ErrorKind::InvalidInput))?;
+            // SAFETY: the casts are for the raw syscall ABI, which takes the
+            // pid_t pid and the unsigned int flags of pidfd_open as c_long. The
+            // call returns a new descriptor, or -1 with the error in errno.
             let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0 as libc::c_long) };
             if fd < 0 {
                 return Err(Error::last_os_error());
             }
             // SAFETY: the descriptor was just created and this process owns it.
             let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
-            Ok(ExitEvent { fd })
+            Ok(ExitEvent::Fd(fd))
         }
 
         #[cfg(target_os = "macos")]
@@ -730,48 +773,98 @@ mod exit_event {
             if added < 0 {
                 return Err(Error::last_os_error());
             }
-            Ok(ExitEvent { fd })
+            Ok(ExitEvent::Fd(fd))
         }
 
-        /// Whether the process exited within `timeout`.
-        #[cfg(target_os = "linux")]
-        pub(super) fn wait(&self, timeout: Duration) -> bool {
-            let mut fd = libc::pollfd {
-                fd: self.fd.as_raw_fd(),
+        /// How a wait of `timeout` on the handle ended.
+        pub(super) fn wait(&self, timeout: Duration) -> Exit {
+            match self {
+                ExitEvent::Fd(fd) => wait_fd(fd, timeout),
+                #[cfg(test)]
+                ExitEvent::Failing(waits) => {
+                    waits.fetch_add(1, Ordering::Relaxed);
+                    Exit::Failed
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_fd(fd: &OwnedFd, timeout: Duration) -> Exit {
+        let started = Instant::now();
+        loop {
+            let mut watched = libc::pollfd {
+                fd: fd.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+            let left = timeout.saturating_sub(started.elapsed());
+            let ms = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
             // SAFETY: poll reads one initialized pollfd that outlives the call.
-            unsafe { libc::poll(&mut fd, 1, ms) > 0 }
+            let reported = unsafe { libc::poll(&mut watched, 1, ms) };
+            if reported == 0 {
+                return Exit::TimedOut;
+            }
+            if reported < 0 {
+                if interrupted() {
+                    continue;
+                }
+                return Exit::Failed;
+            }
+            // A pidfd reports the exit as POLLIN, so any other flag means the
+            // handle cannot report it.
+            return if watched.revents & libc::POLLIN != 0 {
+                Exit::Exited
+            } else {
+                Exit::Failed
+            };
         }
+    }
 
-        #[cfg(target_os = "macos")]
-        pub(super) fn wait(&self, timeout: Duration) -> bool {
+    #[cfg(target_os = "macos")]
+    fn wait_fd(fd: &OwnedFd, timeout: Duration) -> Exit {
+        let started = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(started.elapsed());
             let timeout = libc::timespec {
-                tv_sec: libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX),
-                tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+                tv_sec: libc::time_t::try_from(left.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(left.subsec_nanos()),
             };
             let mut event = std::mem::MaybeUninit::<libc::kevent>::zeroed();
             // SAFETY: kevent writes at most one event into the buffer that
             // outlives the call, and keeps neither pointer.
-            let ready = unsafe {
-                libc::kevent(
-                    self.fd.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    event.as_mut_ptr(),
-                    1,
-                    &timeout,
-                )
+            let reported =
+                unsafe { libc::kevent(fd.as_raw_fd(), std::ptr::null(), 0, event.as_mut_ptr(), 1, &timeout) };
+            if reported == 0 {
+                return Exit::TimedOut;
+            }
+            if reported < 0 {
+                if interrupted() {
+                    continue;
+                }
+                return Exit::Failed;
+            }
+            // SAFETY: kevent reported one event in the buffer.
+            let event = unsafe { event.assume_init() };
+            if event.flags & libc::EV_ERROR != 0 {
+                return Exit::Failed;
+            }
+            return if event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0 {
+                Exit::Exited
+            } else {
+                Exit::Failed
             };
-            ready > 0
         }
+    }
+
+    fn interrupted() -> bool {
+        Error::last_os_error().kind() == ErrorKind::Interrupted
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod exit_event {
+    use super::Exit;
     use std::time::Duration;
 
     pub(super) const VIA: &str = "poll";
@@ -783,8 +876,8 @@ mod exit_event {
     }
 
     impl ExitEvent {
-        pub(super) fn wait(&self, _timeout: Duration) -> bool {
-            false
+        pub(super) fn wait(&self, _timeout: Duration) -> Exit {
+            Exit::Failed
         }
     }
 }
@@ -1078,9 +1171,11 @@ struct FoldedContainer {
 }
 
 /// The session of the process that finalizes the run, for when no journal can
-/// say when the run started or where it ran.
+/// say when the run started or where it ran. Its end is when the finalizer
+/// folded the run, once it was sure nextest was gone.
 struct OwnSession<'a> {
     start: i64,
+    end: i64,
     working_directory: &'a str,
 }
 
@@ -1115,8 +1210,14 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
     // process still fails the session.
     session.incomplete |= journals.iter().any(unreadable);
     for journal in journals.iter().filter(|journal| !journal.module.is_empty()) {
-        let (start, end) = range.unwrap_or((journal.start, journal.end));
-        range = Some((start.min(journal.start), end.max(journal.end)));
+        // A marker is the journal of a process killed before it reported, which
+        // timed the suite it was about to run at the start of the process. The
+        // run ended when the finalizer saw nextest exit, so the suite, its
+        // module and the session cover the time the killed test ran.
+        let marker = journal.state == State::Running;
+        let end = if marker { journal.end.max(own.end) } else { journal.end };
+        let (start, last) = range.unwrap_or((journal.start, end));
+        range = Some((start.min(journal.start), last.max(end)));
         session.early_flake_detection |= journal.early_flake_detection;
         session.faulty |= journal.efd_faulty;
         session.test_management |= journal.test_management;
@@ -1127,7 +1228,7 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
                 service: Some(journal.service.clone()),
                 working_directory: journal.working_directory.clone(),
                 start: journal.start,
-                end: journal.end,
+                end,
                 counts: Counts::default(),
                 incomplete: false,
                 early_flake_detection: false,
@@ -1135,8 +1236,9 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
                 test_management: false,
             });
         module.start = module.start.min(journal.start);
-        module.end = module.end.max(journal.end);
+        module.end = module.end.max(end);
         for suite in &journal.suites {
+            let suite_end = if marker { end } else { suite.end };
             let folded = suites
                 .entry((&journal.module, &suite.name))
                 .or_insert_with(|| FoldedSuite {
@@ -1145,12 +1247,12 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
                     service: journal.service.clone(),
                     working_directory: journal.working_directory.clone(),
                     start: suite.start,
-                    end: suite.end,
+                    end: suite_end,
                     source_file: suite.source_file.clone(),
                     counts: Counts::default(),
                 });
             folded.start = folded.start.min(suite.start);
-            folded.end = folded.end.max(suite.end);
+            folded.end = folded.end.max(suite_end);
             folded.source_file = folded.source_file.take().or(suite.source_file.clone());
         }
     }
@@ -1532,6 +1634,7 @@ mod tests {
     fn own() -> OwnSession<'static> {
         OwnSession {
             start: 5,
+            end: 20,
             working_directory: "fixtures/basic",
         }
     }
@@ -1703,6 +1806,23 @@ mod tests {
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Fail);
         assert_eq!(status_of(&folded, Some("fixture"), None), Status::Fail);
         assert_eq!(status_of(&folded, None, None), Status::Fail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_suite_known_only_from_a_marker_ends_with_the_run() {
+        let dir = temp_dir("marker-end");
+        let killed = join_in(&dir).unwrap();
+        let dir_path = killed.dir.clone();
+        // Killed before it reported, so only the marker written at join is left.
+        drop(killed);
+        let observed = 10_000;
+        let folded = fold(&read_journals(&dir_path), OwnSession { end: observed, ..own() });
+        let suite = folded.suites.first().unwrap();
+        assert!(suite.start <= suite.end, "the suite does not end before it starts");
+        assert!(suite.end >= observed, "the suite covers the time its test ran");
+        assert!(folded.modules[0].end >= suite.end);
+        assert!(folded.session.end >= folded.modules[0].end);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2120,32 +2240,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Asserts that waiting for a runner through `watch` ends with `via` once
-    /// the runner exits.
-    fn ends_the_wait_with(watch: fn(u32) -> Option<exit_event::ExitEvent>, via: &str) {
+    /// The handle `ends_the_wait_with` registers and the signal that the wait
+    /// took it.
+    type Registration = (std::sync::mpsc::Sender<()>, Option<exit_event::ExitEvent>);
+    static REGISTRATION: std::sync::Mutex<Option<Registration>> = std::sync::Mutex::new(None);
+    /// The watcher tests register one handle at a time, or they would swap
+    /// their handles.
+    static WATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn registered(_pid: u32) -> Option<exit_event::ExitEvent> {
+        let (setup, handle) = REGISTRATION.lock().unwrap().take().unwrap();
+        let _ = setup.send(());
+        handle
+    }
+
+    fn ends_the_wait_with(watch: fn(u32) -> Option<exit_event::ExitEvent>, via: &'static str) {
+        let _serial = WATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut child, id, stdin) = blocking_runner();
+        let id = id.unwrap();
         let reaper = std::thread::spawn(move || child.wait().unwrap());
+        // The handle is registered while the runner waits on the pipe, so no
+        // kernel can refuse the event of a process that is already gone.
+        let (setup, set_up) = std::sync::mpsc::channel();
+        *REGISTRATION.lock().unwrap() = Some((setup, watch(id.pid)));
         let mut limits = limits(Duration::from_secs(10), Duration::from_millis(100));
-        limits.watch = watch;
-        let waited = waiting(move || wait_for_runner(id.unwrap(), &limits));
-        assert!(
-            waited.recv_timeout(Duration::from_millis(100)).is_err(),
-            "the runner is still running"
-        );
+        limits.watch = registered;
+        let waited = waiting(move || wait_for_runner(id, &limits));
+        set_up.recv_timeout(Duration::from_secs(30)).unwrap();
         drop(stdin);
-        assert_eq!(waited.recv_timeout(Duration::from_secs(30)).unwrap(), via);
+        let waited = waited.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(waited, Waited { exited: true, via });
         reaper.join().unwrap();
+    }
+
+    /// Whether the kernel reports the exit of a process through an exit event.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exit_event_available() -> bool {
+        let (mut child, id, _stdin) = blocking_runner();
+        let available = exit_event::watch(id.unwrap().pid).is_some();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        available
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn a_pidfd_ends_the_wait_when_the_runner_exits() {
+        if !exit_event_available() {
+            println!("note: pidfd_open is not available here, skipping the exit event path");
+            return;
+        }
         ends_the_wait_with(exit_event::watch, "pidfd");
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn a_kqueue_event_ends_the_wait_when_the_runner_exits() {
+        if !exit_event_available() {
+            println!("note: kqueue does not report process exits here, skipping the exit event path");
+            return;
+        }
         ends_the_wait_with(exit_event::watch, "kqueue");
     }
 
@@ -2154,21 +2308,35 @@ mod tests {
         ends_the_wait_with(|_| None, "poll");
     }
 
+    /// The waits of the handle that always fails, which the test below counts.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    static FAILING_WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn failing(_pid: u32) -> Option<exit_event::ExitEvent> {
+        Some(exit_event::ExitEvent::failing(&FAILING_WAITS))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_failing_exit_event_falls_back_to_polling() {
+        ends_the_wait_with(failing, "poll");
+        assert_eq!(
+            FAILING_WAITS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a failed wait is not retried"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_exit_event_wait_ends_at_the_deadline() {
         let (mut child, id) = runner(Command::new("sh").args(["-c", "sleep 5"]));
-        let started = Instant::now();
-        let via = wait_for_runner(
+        let waited = wait_for_runner(
             id.unwrap(),
             &limits(Duration::from_millis(200), Duration::from_millis(100)),
         );
-        assert!(
-            started.elapsed() >= Duration::from_millis(200),
-            "the deadline bounds the wait"
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-        assert_eq!(via, exit_event::VIA, "the wait used the exit event");
+        assert!(!waited.exited, "the deadline bounds the wait");
         child.kill().unwrap();
         child.wait().unwrap();
     }
