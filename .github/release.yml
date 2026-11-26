@@ -1,0 +1,17 @@
+changelog:
+  exclude:
+    labels: [no-release-notes]
+    authors:
+      - dependabot
+      - dependabot[bot]
+  categories:
+    - title: Features
+      labels: [enhancement]
+    - title: Fixes
+      labels: [bug]
+    - title: Performance
+      labels: [performance]
+    - title: Documentation
+      labels: [documentation]
+    - title: Other changes
+      labels: ["*"]
