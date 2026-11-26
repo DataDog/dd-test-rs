@@ -577,6 +577,10 @@ struct Limits {
     poll: Duration,
     /// The handle that reports the exit of the runner, `None` to poll for it.
     watch: fn(u32) -> Option<exit_event::ExitEvent>,
+    /// Set once the initial liveness check of the runner passed, so a watcher
+    /// test releases its runner only after the check.
+    #[cfg(test)]
+    checked: Option<&'static std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for Limits {
@@ -586,6 +590,8 @@ impl Default for Limits {
             drain: DRAIN_TIMEOUT,
             poll: POLL_INTERVAL,
             watch: exit_event::watch,
+            #[cfg(test)]
+            checked: None,
         }
     }
 }
@@ -655,6 +661,10 @@ fn wait_for_runner(runner: ProcessId, limits: &Limits) -> Waited {
     } else {
         "poll"
     };
+    #[cfg(test)]
+    if let Some(checked) = limits.checked {
+        checked.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
     while !exited {
         let left = limits.runner_wait.saturating_sub(started.elapsed());
         if left.is_zero() {
@@ -2273,6 +2283,8 @@ mod tests {
             drain,
             poll: Duration::from_millis(10),
             watch: exit_event::watch,
+            #[cfg(test)]
+            checked: None,
         }
     }
 
@@ -2315,6 +2327,9 @@ mod tests {
         handle
     }
 
+    /// Set once the wait for the runner passed its initial liveness check.
+    static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
     fn ends_the_wait_with(watch: fn(u32) -> Option<exit_event::ExitEvent>, via: &'static str) {
         let _serial = WATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (mut child, id, stdin) = blocking_runner();
@@ -2324,10 +2339,15 @@ mod tests {
         // kernel can refuse the event of a process that is already gone.
         let (setup, set_up) = std::sync::mpsc::channel();
         *REGISTRATION.lock().unwrap() = Some((setup, watch(id.pid)));
+        CHECKED.store(0, std::sync::atomic::Ordering::Relaxed);
         let mut limits = limits(Duration::from_secs(10), Duration::from_millis(100));
         limits.watch = registered;
+        limits.checked = Some(&CHECKED);
         let waited = waiting(move || wait_for_runner(id, &limits));
         set_up.recv_timeout(Duration::from_secs(30)).unwrap();
+        // The runner is released only after the check, so the wait cannot end
+        // via:gone and the test checks the path it set up.
+        eventually(|| (CHECKED.load(std::sync::atomic::Ordering::Relaxed) == 1).then_some(()));
         drop(stdin);
         let waited = waited.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(waited, Waited { exited: true, via });
