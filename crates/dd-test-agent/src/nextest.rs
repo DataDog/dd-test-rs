@@ -93,7 +93,7 @@ pub(crate) fn runner_attempt(hello: &Hello) -> Option<RunnerAttempt> {
     if !runner_command(&hello.command) || nextest_parent(hello.parent_pid).is_none() {
         return None;
     }
-    RunEnv::from_env()?.runner_attempt()
+    RunEnv::from_env()?.runner_attempt(&hello.crate_name)
 }
 
 /// The harness falls back to the arguments of the test binary when it cannot
@@ -160,8 +160,12 @@ impl RunEnv {
     }
 
     /// The attempt of the run, `None` when nextest does not number the attempts it runs.
-    fn runner_attempt(&self) -> Option<RunnerAttempt> {
-        RunnerAttempt::new(self.attempt?, self.total_attempts?)
+    fn runner_attempt(&self, crate_name: &str) -> Option<RunnerAttempt> {
+        RunnerAttempt::new(
+            self.attempt?,
+            self.total_attempts?,
+            split_test_name(crate_name, &self.test_name),
+        )
     }
 }
 
@@ -1614,6 +1618,7 @@ fn escape(_log: Option<&File>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dd_test_core::protocol::TestId;
     use std::path::Path;
     use std::process::Command;
 
@@ -2739,7 +2744,7 @@ mod tests {
             ("NEXTEST_EXECUTION_MODE", "process-per-test"),
             ("NEXTEST_RUN_ID", "0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10"),
             ("NEXTEST_BINARY_ID", "fixture::integration"),
-            ("NEXTEST_TEST_NAME", "integration::adds"),
+            ("NEXTEST_TEST_NAME", "adds"),
         ];
         values.extend_from_slice(extra);
         RunEnv::from_lookup(|key| {
@@ -2748,7 +2753,11 @@ mod tests {
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| value.to_string())
         })
-        .and_then(|run| run.runner_attempt())
+        .and_then(|run| run.runner_attempt("integration"))
+    }
+
+    fn scheduled_test() -> TestId {
+        ("integration".to_string(), "adds".to_string())
     }
 
     #[test]
@@ -2756,13 +2765,16 @@ mod tests {
         let attempt = |number: &'static str, total: &'static str| {
             attempt_from(&[("NEXTEST_ATTEMPT", number), ("NEXTEST_TOTAL_ATTEMPTS", total)])
         };
-        assert_eq!(attempt("2", "3"), Some(RunnerAttempt { number: 2, total: 3 }));
-        assert_eq!(attempt("1", "3"), Some(RunnerAttempt { number: 1, total: 3 }));
-        assert_eq!(
-            attempt("1", "1"),
-            Some(RunnerAttempt { number: 1, total: 1 }),
-            "nextest without --retries"
-        );
+        let expected = |number, total| {
+            Some(RunnerAttempt {
+                number,
+                total,
+                test: scheduled_test(),
+            })
+        };
+        assert_eq!(attempt("2", "3"), expected(2, 3));
+        assert_eq!(attempt("1", "3"), expected(1, 3));
+        assert_eq!(attempt("1", "1"), expected(1, 1), "nextest without --retries");
         assert_eq!(attempt_from(&[]), None, "nextest does not report the attempt");
     }
 
@@ -2785,7 +2797,7 @@ mod tests {
         );
         assert!(
             RunEnv::from_lookup(|_| None)
-                .and_then(|run| run.runner_attempt())
+                .and_then(|run| run.runner_attempt("integration"))
                 .is_none(),
             "plain cargo test has no attempt of a run"
         );

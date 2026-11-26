@@ -179,10 +179,11 @@ With `cargo test`, each test binary is reported as a test session. With `cargo n
 nextest runs each test in its own process. A `cargo nextest run` is reported as one test session, with one test module per package and one test suite per suite name.
 
 - The agent started by one test process of the run, not necessarily the first, sends the suite, module and session results after nextest exits, usually within a second. CI systems that stop leftover processes as soon as the command ends, such as some container executors, can drop them.
-- With `--retries`, each attempt is reported as its own test execution. Suites, modules and the session take the result of the last attempt. Attempts after the first are reported as retries with the `external` reason, and only an attempt that passes, or the last one, reports its final status.
+- With `--retries`, each attempt is reported as its own test execution. Suites, modules and the session take the result of the last attempt. From nextest's attempt variables, the first execution of every attempt after the first is reported as a retry with the `external` reason, and retries that Datadog runs inside that attempt keep their own reason. `test.final_status` is reported on the last execution of an attempt that passes, or of the last attempt.
 - `DD_CIVISIBILITY_TOTAL_FLAKY_RETRY_COUNT` limits the retries of each test, not of the whole run.
 - Early Flake Detection does not detect runs with too many new tests.
 - nextest versions that do not set `NEXTEST_BINARY_ID` or `NEXTEST_WORKSPACE_ROOT` report each test as its own test session, and so does a machine where the harness cannot read the command of the parent process.
+- When the parent of the test process is not nextest, such as a wrapper script that does not `exec` the test binary, each attempt is reported as a first execution.
 
 With `DD_TRACE_DEBUG=true`, the run writes its debug log to `<read cache dir>/nextest/<run id>.log`.
 

@@ -196,8 +196,8 @@ impl Session {
             _ => Mode::Normal,
         };
         let quarantined = props.quarantined && !matches!(mode, Mode::AttemptToFix(_));
-        // The runner retries in a new process, so a retried attempt reports its first execution as the retry.
-        let runner_retry = self.runner_attempt.is_some_and(|attempt| attempt.number > 1);
+        let runner_attempt = self.runner_attempt.as_ref().filter(|attempt| attempt.test == plan.id);
+        let runner_retry = runner_attempt.is_some_and(|attempt| attempt.number > 1);
 
         let mut executions = 0u32;
         let mut any_pass = false;
@@ -266,22 +266,23 @@ impl Session {
                 _ => any_pass || quarantined,
             };
             let outcome = if verdict { Status::Pass } else { Status::Fail };
-            let is_final = match self.runner_attempt {
+            let is_final = match runner_attempt {
                 Some(attempt) => verdict || attempt.number >= attempt.total,
                 None => true,
             };
             if !retry {
                 let tags = &mut record.tags;
+                if is_final && executions > 1 && !any_pass {
+                    tags.insert("test.has_failed_all_retries".into(), "true".into());
+                }
+                if matches!(mode, Mode::AttemptToFix(_)) {
+                    // nextest retries only a failed attempt, so an earlier one of this test already failed.
+                    tags.insert(
+                        "test.test_management.attempt_to_fix_passed".into(),
+                        (!any_fail && !runner_retry).to_string(),
+                    );
+                }
                 if is_final {
-                    if executions > 1 && !any_pass {
-                        tags.insert("test.has_failed_all_retries".into(), "true".into());
-                    }
-                    if matches!(mode, Mode::AttemptToFix(_)) {
-                        tags.insert(
-                            "test.test_management.attempt_to_fix_passed".into(),
-                            (!any_fail && !runner_retry).to_string(),
-                        );
-                    }
                     tags.insert("test.final_status".into(), outcome.as_str().into());
                 }
                 record.outcome = Some(outcome);
@@ -612,8 +613,17 @@ mod tests {
     }
 
     fn retry_attempt(number: u32, total: u32) -> Bootstrap {
+        attempt_of(number, total, "flaky")
+    }
+
+    /// A runner that scheduled `test` in this process, at the given attempt.
+    fn attempt_of(number: u32, total: u32, test: &str) -> Bootstrap {
         Bootstrap {
-            runner_attempt: Some(RunnerAttempt { number, total }),
+            runner_attempt: Some(RunnerAttempt {
+                number,
+                total,
+                test: ("c".to_string(), test.to_string()),
+            }),
             ..Bootstrap::default()
         }
     }
@@ -910,8 +920,26 @@ mod tests {
         let first = executions(bootstrap(1), &[true, true]);
         assert_eq!(first[1].tags["test.test_management.attempt_to_fix_passed"], "true");
 
+        let failed = executions(bootstrap(1), &[false]);
+        assert_eq!(failed[0].tags["test.test_management.attempt_to_fix_passed"], "false");
+        assert_eq!(
+            failed[0].tags.get("test.final_status"),
+            None,
+            "nextest retries the failure"
+        );
+
         let retried = executions(bootstrap(2), &[true, true]);
         assert_eq!(retried[1].tags["test.test_management.attempt_to_fix_passed"], "false");
         assert_eq!(retried[1].tags["test.final_status"], "pass");
+    }
+
+    #[test]
+    fn a_test_the_runner_did_not_schedule_behaves_as_without_an_attempt() {
+        for results in [&[true][..], &[false][..]] {
+            let without = executions(Bootstrap::default(), results);
+            let reported = executions(attempt_of(2, 3, "other"), results);
+            assert_eq!(reported[0].tags, without[0].tags, "{results:?}");
+            assert_eq!(reported[0].outcome, without[0].outcome, "{results:?}");
+        }
     }
 }
