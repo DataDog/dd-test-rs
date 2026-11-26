@@ -553,6 +553,21 @@ fn os_platform() -> &'static str {
     }
 }
 
+#[cfg(unix)]
+fn os_version() -> Option<String> {
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+    if unsafe { libc::uname(uts.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let release = unsafe { uts.assume_init() }.release;
+    let version = unsafe { std::ffi::CStr::from_ptr(release.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+#[cfg(not(unix))]
 fn os_version() -> Option<String> {
     let output = std::process::Command::new("uname").arg("-r").output().ok()?;
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -588,6 +603,20 @@ mod tests {
         assert_eq!(repo_root(dir.join("other").to_str(), &member), member);
         assert_eq!(repo_root(None, &member), member);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_the_os_release_like_uname() {
+        let output = std::process::Command::new("uname")
+            .arg("-r")
+            .env_remove("UNAME_RELEASE")
+            .env_remove("UNAME_r")
+            .output()
+            .unwrap();
+        let expected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert!(output.status.success());
+        assert_eq!(os_version().as_deref(), Some(expected.as_str()));
     }
 
     #[test]
