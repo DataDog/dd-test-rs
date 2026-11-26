@@ -63,6 +63,8 @@ A maintainer reviews every pull request. To be merged, a pull request must:
 - Have a title that follows [Conventional Commits](https://www.conventionalcommits.org/), such as `fix(agent): retry failed uploads`.
 - Contain only signed commits. See [signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits).
 
+The type in the title also decides the section of the release notes: `feat` for Features, `fix` for Fixes, `perf` for Performance and `docs` for Documentation. Pull requests titled `ci`, `chore`, `build`, `test`, `refactor`, `style` or `revert` are left out of the release notes. The label is set from the title when the pull request merges.
+
 Keep pull requests focused on one change. Small pull requests are reviewed faster.
 
 ### Checks
