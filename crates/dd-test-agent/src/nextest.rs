@@ -1183,8 +1183,10 @@ struct OwnSession<'a> {
 /// new process.
 fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
     let mut kept: BTreeMap<(&str, &str, Option<u64>), &Journal> = BTreeMap::new();
+    let mut starts: BTreeMap<(&str, &str, Option<u64>), BTreeMap<u32, i64>> = BTreeMap::new();
     for journal in journals {
         let key = (journal.binary_id.as_str(), journal.test_name.as_str(), journal.stress);
+        starts.entry(key).or_default().insert(journal.attempt, journal.start);
         let replaced = kept.get(&key).is_none_or(|current| journal.attempt > current.attempt);
         if replaced {
             kept.insert(key, journal);
@@ -1211,13 +1213,24 @@ fn fold(journals: &[Journal], own: OwnSession<'_>) -> Folded {
     session.incomplete |= journals.iter().any(unreadable);
     for journal in journals.iter().filter(|journal| !journal.module.is_empty()) {
         // A marker is the journal of a process killed before it reported, which
-        // timed the suite it was about to run at the start of the process. The
-        // run ended when the finalizer saw nextest exit, so the suite, its
-        // module and the session cover the time the killed test ran.
+        // timed the suite it was about to run at the start of the process. A
+        // retry of its test bounds when it ended; without one, it ended before
+        // the run did.
         let marker = journal.state == State::Running;
-        let end = if marker { journal.end.max(own.end) } else { journal.end };
-        let (start, last) = range.unwrap_or((journal.start, end));
-        range = Some((start.min(journal.start), last.max(end)));
+        let end = if marker {
+            let key = (journal.binary_id.as_str(), journal.test_name.as_str(), journal.stress);
+            let next = starts[&key]
+                .range(journal.attempt + 1..)
+                .next()
+                .map(|(_, start)| *start);
+            journal.end.max(next.unwrap_or(own.end))
+        } else {
+            journal.end
+        };
+        // The session covers the run, so a marker still extends it to own.end.
+        let covered = if marker { journal.end.max(own.end) } else { end };
+        let (start, last) = range.unwrap_or((journal.start, covered));
+        range = Some((start.min(journal.start), last.max(covered)));
         session.early_flake_detection |= journal.early_flake_detection;
         session.faulty |= journal.efd_faulty;
         session.test_management |= journal.test_management;
@@ -1732,6 +1745,54 @@ mod tests {
         let folded = fold_run(&[killed, passed]);
         assert_eq!(status_of(&folded, None, Some("integration")), Status::Pass);
         assert!(!folded.session.incomplete);
+    }
+
+    #[test]
+    fn a_superseded_marker_ends_before_the_attempt_that_replaced_it() {
+        let mut killed = journal("fixture", "integration", "a", None);
+        killed.state = State::Running;
+        killed.start = 10;
+        killed.end = 10;
+        killed.suites[0].end = 10;
+        // Another suite the killed process reported, so the test can tell where
+        // its attempt ends from where the retry ends.
+        killed.suites.push(SuiteEntry {
+            name: "reported".to_string(),
+            start: 10,
+            end: 10,
+            source_file: None,
+        });
+        let mut passed = journal("fixture", "integration", "a", Some(Status::Pass));
+        passed.attempt = 2;
+        passed.start = 20;
+        passed.end = 30;
+        passed.suites[0].start = 20;
+        passed.suites[0].end = 30;
+        let observed = 100;
+        let began = passed.start;
+        let ended = passed.end;
+        let folded = fold(&[killed, passed], OwnSession { end: observed, ..own() });
+
+        let suite = |name: &str| folded.suites.iter().find(|suite| suite.name == name).unwrap();
+        let attempt = suite("reported");
+        assert!(
+            attempt.start <= attempt.end && attempt.end <= began,
+            "the killed attempt ends before its retry: {}..{}",
+            attempt.start,
+            attempt.end
+        );
+        let shared = suite("integration");
+        assert_eq!(
+            (shared.start, shared.end),
+            (10, ended),
+            "the suite ends when its retry does"
+        );
+        assert_eq!(
+            (folded.modules[0].start, folded.modules[0].end),
+            (10, ended),
+            "the module ends when its package does"
+        );
+        assert_eq!(folded.session.end, observed, "the session still covers the run");
     }
 
     #[test]
