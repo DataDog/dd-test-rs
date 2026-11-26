@@ -155,6 +155,18 @@ fn run_fixture(args: &[&str], env: &[(&str, &str)]) -> Run {
     run_fixture_with_upload_delay(args, env, Duration::ZERO)
 }
 
+/// Cargo runs the fixture, with the toolchain `DD_TEST_E2E_TOOLCHAIN` selects.
+fn cargo() -> Command {
+    match std::env::var("DD_TEST_E2E_TOOLCHAIN") {
+        Ok(toolchain) => {
+            let mut command = Command::new("cargo");
+            command.arg(format!("+{toolchain}"));
+            command
+        }
+        Err(_) => Command::new(env!("CARGO")),
+    }
+}
+
 fn run_fixture_with_upload_delay(args: &[&str], env: &[(&str, &str)], upload_delay: Duration) -> Run {
     run_fixture_against(
         Recorded {
@@ -176,14 +188,7 @@ fn run_fixture_against(intake: Recorded, args: &[&str], env: &[(&str, &str)]) ->
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let read_cache = root.join(format!("target/e2e/read-cache/{}", url.rsplit(':').next().unwrap()));
     let _ = std::fs::remove_dir_all(&read_cache);
-    let mut command = match std::env::var("DD_TEST_E2E_TOOLCHAIN") {
-        Ok(toolchain) => {
-            let mut command = Command::new("cargo");
-            command.arg(format!("+{toolchain}"));
-            command
-        }
-        Err(_) => Command::new(env!("CARGO")),
-    };
+    let mut command = cargo();
     for var in CI_PROVIDER_VARS {
         command.env_remove(var);
     }
@@ -404,6 +409,158 @@ fn ensure_time_disables_retries_and_report_time_keeps_them() {
     let recorded = report.recorded.lock().unwrap();
     assert_eq!(tests_named(&recorded.events, "basic::tests", "flaky_once").len(), 2);
     assert_eq!(tests_named(&recorded.events, "basic::tests::nested", "deep").len(), 3);
+}
+
+#[test]
+fn nextest_reports_one_session_for_the_run() {
+    let version = cargo().args(["nextest", "--version"]).output();
+    if !version.as_ref().is_ok_and(|output| output.status.success()) {
+        let reason = match &version {
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "cargo-nextest must be installed in CI: {reason}"
+        );
+        eprintln!("skipping nextest_reports_one_session_for_the_run: cargo-nextest is not installed: {reason}");
+        return;
+    }
+    let run = run_fixture(
+        &["nextest", "run", "--no-fail-fast", "--retries", "1"],
+        &[
+            ("DD_CIVISIBILITY_FLAKY_RETRY_ENABLED", "false"),
+            ("DD_TEST_MANAGEMENT_ENABLED", "false"),
+        ],
+    );
+    let nextest_output = String::from_utf8_lossy(&run.output.stderr).to_string();
+    assert!(!nextest_output.contains("LEAK"), "{nextest_output}");
+    assert!(
+        !run.output.status.success(),
+        "the failing test fails the run:\n{nextest_output}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while events_of(&run.recorded.lock().unwrap().events, "test_session_end").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "nextest exits before the finalizer reports the session:\n{nextest_output}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    {
+        let recorded = run.recorded.lock().unwrap();
+        let events = &recorded.events;
+
+        assert_eq!(events_of(events, "test_session_end").len(), 1, "one session per run");
+        assert_eq!(events_of(events, "test_module_end").len(), 1, "one module per package");
+        let session = events_of(events, "test_session_end")[0];
+        let module = events_of(events, "test_module_end")[0];
+        let (session_id, module_id) = (
+            &session["content"]["test_session_id"],
+            &module["content"]["test_module_id"],
+        );
+
+        let tests = events_of(events, "test");
+        assert!(!tests.is_empty());
+        let mut suites: Vec<&str> = tests.iter().map(|test| meta(test, "test.suite")).collect();
+        suites.sort_unstable();
+        suites.dedup();
+        let ends: Vec<&Value> = events_of(events, "test_suite_end");
+        let mut ended: Vec<&str> = ends.iter().map(|end| meta(end, "test.suite")).collect();
+        ended.sort_unstable();
+        assert_eq!(ended, suites, "one suite end per suite");
+
+        for event in tests.iter().chain(ends.iter()).chain([&session, &module]) {
+            assert_eq!(&event["content"]["test_session_id"], session_id);
+            assert_eq!(
+                meta(event, "test.working_directory"),
+                "fixtures/basic",
+                "the session fingerprint is the same on every event of the run"
+            );
+        }
+        for test in &tests {
+            assert_eq!(&test["content"]["test_module_id"], module_id);
+        }
+        let start = |event: &Value| event["content"]["start"].as_i64().expect("every event has a start");
+        let (module_start, session_start) = (start(module), start(session));
+        assert!(session_start <= module_start, "the session starts before its module");
+        for event in tests.iter().chain(ends.iter()) {
+            assert!(
+                session_start <= start(event),
+                "the session starts before every suite and test"
+            );
+            assert!(
+                module_start <= start(event),
+                "the module starts before every suite and test"
+            );
+        }
+        for end in &ends {
+            let suite = meta(end, "test.suite");
+            for test in tests.iter().filter(|test| meta(test, "test.suite") == suite) {
+                assert_eq!(test["content"]["test_suite_id"], end["content"]["test_suite_id"]);
+            }
+        }
+
+        for end in &ends {
+            match meta(end, "test.suite") {
+                "basic::tests" => assert_eq!(meta(end, "test.status"), "pass", "the last attempt wins"),
+                "integration" => assert_eq!(meta(end, "test.status"), "fail"),
+                _ => {}
+            }
+        }
+        assert_eq!(meta(module, "test.status"), "fail");
+        assert_eq!(meta(session, "test.status"), "fail");
+        assert_eq!(meta(session, "test.module"), "basic-fixture");
+        assert!(
+            meta(session, "test.command").starts_with("cargo-nextest nextest run"),
+            "{}",
+            meta(session, "test.command")
+        );
+        assert_eq!(
+            tests_named(events, "basic::tests", "flaky_once").len(),
+            2,
+            "one event per attempt"
+        );
+    }
+
+    let nextest_dir = run.read_cache.join("nextest");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let kept = std::fs::read_dir(&nextest_dir)
+            .map(|entries| entries.flatten().any(|entry| entry.path().is_dir()))
+            .unwrap_or(false);
+        if !kept {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} keeps the directory of the run",
+            nextest_dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let recorded = run.recorded.lock().unwrap();
+    let events = &recorded.events;
+    assert_eq!(
+        events_of(events, "test_session_end").len(),
+        1,
+        "the finished finalizer sends no second session"
+    );
+    assert_eq!(events_of(events, "test_module_end").len(), 1);
+    let mut suites: Vec<&str> = events_of(events, "test")
+        .iter()
+        .map(|test| meta(test, "test.suite"))
+        .collect();
+    suites.sort_unstable();
+    suites.dedup();
+    let mut ended: Vec<&str> = events_of(events, "test_suite_end")
+        .iter()
+        .map(|end| meta(end, "test.suite"))
+        .collect();
+    ended.sort_unstable();
+    assert_eq!(ended, suites, "one suite end per suite, with no duplicate");
 }
 
 #[test]

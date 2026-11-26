@@ -385,15 +385,32 @@ fn take_over(path: &Path, stale: &[u8], lock: Lock) -> Acquire {
 /// The open guard file, locked until it is dropped, or `None` when another
 /// agent holds it.
 #[cfg(unix)]
-fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
+pub(crate) fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::io::AsRawFd;
     let file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .open(path)?;
+    guard(file)
+}
+
+/// The guard of a lock file that exists, without creating it, or `None` when
+/// the file is gone or another agent holds it.
+#[cfg(unix)]
+pub(crate) fn existing_guard(path: &Path) -> std::io::Result<Option<File>> {
+    let file = match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    guard(file)
+}
+
+#[cfg(unix)]
+fn guard(file: File) -> std::io::Result<Option<File>> {
+    use std::os::unix::io::AsRawFd;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(Some(file));
     }
@@ -406,7 +423,12 @@ fn takeover_guard(path: &Path) -> std::io::Result<Option<File>> {
 }
 
 #[cfg(not(unix))]
-fn takeover_guard(_path: &Path) -> std::io::Result<Option<File>> {
+pub(crate) fn takeover_guard(_path: &Path) -> std::io::Result<Option<File>> {
+    Err(ErrorKind::Unsupported.into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn existing_guard(_path: &Path) -> std::io::Result<Option<File>> {
     Err(ErrorKind::Unsupported.into())
 }
 
@@ -457,7 +479,7 @@ fn release(path: &Path, lock: &Lock) {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -468,7 +490,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
-fn create_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir(dir: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

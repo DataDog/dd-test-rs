@@ -12,6 +12,7 @@ pub mod ci;
 pub mod config;
 pub use dd_test_core::env;
 pub mod event;
+mod nextest;
 pub mod read_cache;
 pub use dd_test_core::ids;
 pub mod server;

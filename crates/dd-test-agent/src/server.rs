@@ -39,6 +39,7 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
     }
     let (mut session, bootstrap) = AgentSession::start(&hello, config);
     reply(&mut output, Message::Bootstrap(bootstrap));
+    session.join_run(&hello);
 
     for line in lines {
         let Ok(line) = line else { break };
@@ -53,6 +54,7 @@ pub fn serve(input: impl BufRead, mut output: impl Write) -> i32 {
             }
             Ok(Message::Cancel) => {
                 debug!("the test binary runs without Datadog, nothing is reported");
+                session.cancel();
                 detach_stderr();
                 session.close();
                 return 0;

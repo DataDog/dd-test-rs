@@ -9,10 +9,15 @@ pub fn add(a: i32, b: i32) -> i32 {
 
 static FLAKY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-/// Fails the first `BASIC_FLAKY_FAILURES` calls (default 1) in this process.
+/// Fails the first `BASIC_FLAKY_FAILURES` calls (default 1) of the test, counting
+/// the earlier attempts of a nextest retry, which runs in a new process.
 pub fn flaky() -> bool {
     let failures = std::env::var("BASIC_FLAKY_FAILURES").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) >= failures
+    let earlier = std::env::var("NEXTEST_ATTEMPT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map_or(0, |attempt| attempt.saturating_sub(1));
+    earlier + FLAKY_CALLS.fetch_add(1, Ordering::SeqCst) >= failures
 }
 
 #[cfg(test)]
