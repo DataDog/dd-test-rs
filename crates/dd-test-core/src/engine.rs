@@ -276,7 +276,7 @@ impl Session {
                     tags.insert("test.has_failed_all_retries".into(), "true".into());
                 }
                 if matches!(mode, Mode::AttemptToFix(_)) {
-                    // nextest retries only a failed attempt, so an earlier one of this test already failed.
+                    // The runner retries only a failed attempt, so an earlier attempt of this test failed.
                     tags.insert(
                         "test.test_management.attempt_to_fix_passed".into(),
                         (!any_fail && !runner_retry).to_string(),
