@@ -1,0 +1,2 @@
+[profile.default]
+run-extra-args = ["tests::passes"]

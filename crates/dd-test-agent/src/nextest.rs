@@ -23,7 +23,7 @@ use crate::telemetry::Telemetry;
 use crate::transport::Transport;
 use crate::uploader;
 use dd_test_core::engine::split_test_name;
-use dd_test_core::protocol::{Hello, Status};
+use dd_test_core::protocol::{Hello, RunnerAttempt, Status};
 use dd_test_core::{debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -87,6 +87,15 @@ pub(crate) fn join(
     Some(member)
 }
 
+/// The attempt of the `cargo nextest run` this test process runs, read before
+/// the run is joined so that a journal that cannot be written does not drop it.
+pub(crate) fn runner_attempt(hello: &Hello) -> Option<RunnerAttempt> {
+    if !runner_command(&hello.command) || nextest_parent(hello.parent_pid).is_none() {
+        return None;
+    }
+    RunEnv::from_env()?.runner_attempt(&hello.crate_name)
+}
+
 /// The harness falls back to the arguments of the test binary when it cannot
 /// read the parent process, which differ from test to test. Only the command of
 /// the nextest process keeps the session fingerprint of the run the same.
@@ -121,7 +130,8 @@ struct RunEnv {
     run_id: String,
     binary_id: String,
     test_name: String,
-    attempt: u32,
+    attempt: Option<u32>,
+    total_attempts: Option<u32>,
     stress: Option<u64>,
 }
 
@@ -143,9 +153,19 @@ impl RunEnv {
             run_id,
             binary_id: value("NEXTEST_BINARY_ID")?,
             test_name: value("NEXTEST_TEST_NAME")?,
-            attempt: value("NEXTEST_ATTEMPT").and_then(|v| v.parse().ok()).unwrap_or(1),
+            attempt: value("NEXTEST_ATTEMPT").and_then(|v| v.parse().ok()),
+            total_attempts: value("NEXTEST_TOTAL_ATTEMPTS").and_then(|v| v.parse().ok()),
             stress: value("NEXTEST_STRESS_CURRENT").and_then(|v| v.parse().ok()),
         })
+    }
+
+    /// The attempt of the run, `None` when nextest does not number the attempts it runs.
+    fn runner_attempt(&self, crate_name: &str) -> Option<RunnerAttempt> {
+        RunnerAttempt::new(
+            self.attempt?,
+            self.total_attempts?,
+            split_test_name(crate_name, &self.test_name),
+        )
     }
 }
 
@@ -293,7 +313,7 @@ impl Member {
             runtime_id: session.runtime_id,
             binary_id: run.binary_id,
             test_name: run.test_name,
-            attempt: run.attempt,
+            attempt: run.attempt.unwrap_or(1),
             stress: run.stress,
             module: session.module,
             suite,
@@ -1598,6 +1618,7 @@ fn escape(_log: Option<&File>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dd_test_core::protocol::TestId;
     use std::path::Path;
     use std::process::Command;
 
@@ -1613,7 +1634,8 @@ mod tests {
             run_id: run_id.to_string(),
             binary_id: "fixture::integration".to_string(),
             test_name: "adds".to_string(),
-            attempt: 1,
+            attempt: Some(1),
+            total_attempts: Some(1),
             stress: None,
         }
     }
@@ -2001,7 +2023,8 @@ mod tests {
                 run_id: "0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10".to_string(),
                 binary_id: format!("{module}::tests"),
                 test_name: test.to_string(),
-                attempt: 1,
+                attempt: Some(1),
+                total_attempts: Some(1),
                 stress: None,
             };
             let suite = SuiteEntry {
@@ -2713,6 +2736,71 @@ mod tests {
             _ => None,
         });
         assert!(without_mode.is_none(), "plain cargo test never joins");
+    }
+
+    /// The attempt nextest reports, from the variables it sets in the test process.
+    fn attempt_from(extra: &[(&str, &str)]) -> Option<RunnerAttempt> {
+        let mut values = vec![
+            ("NEXTEST_EXECUTION_MODE", "process-per-test"),
+            ("NEXTEST_RUN_ID", "0b8a2f6e-4f3e-4f0a-9a1e-9d6c7b3f2a10"),
+            ("NEXTEST_BINARY_ID", "fixture::integration"),
+            ("NEXTEST_TEST_NAME", "adds"),
+        ];
+        values.extend_from_slice(extra);
+        RunEnv::from_lookup(|key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+        .and_then(|run| run.runner_attempt("integration"))
+    }
+
+    fn scheduled_test() -> TestId {
+        ("integration".to_string(), "adds".to_string())
+    }
+
+    #[test]
+    fn reads_the_attempt_of_the_run() {
+        let attempt = |number: &'static str, total: &'static str| {
+            attempt_from(&[("NEXTEST_ATTEMPT", number), ("NEXTEST_TOTAL_ATTEMPTS", total)])
+        };
+        let expected = |number, total| {
+            Some(RunnerAttempt {
+                number,
+                total,
+                test: scheduled_test(),
+            })
+        };
+        assert_eq!(attempt("2", "3"), expected(2, 3));
+        assert_eq!(attempt("1", "3"), expected(1, 3));
+        assert_eq!(attempt("1", "1"), expected(1, 1), "nextest without --retries");
+        assert_eq!(attempt_from(&[]), None, "nextest does not report the attempt");
+    }
+
+    #[test]
+    fn rejects_numbers_that_are_not_an_attempt_of_the_run() {
+        let attempt = |number: &'static str, total: &'static str| {
+            attempt_from(&[("NEXTEST_ATTEMPT", number), ("NEXTEST_TOTAL_ATTEMPTS", total)])
+        };
+        assert!(attempt("0", "3").is_none());
+        assert!(
+            attempt("4", "3").is_none(),
+            "nextest runs no more attempts than it allows"
+        );
+        assert!(attempt("two", "3").is_none());
+        assert!(attempt("2", "three").is_none());
+        assert!(attempt("2", "0").is_none());
+        assert!(
+            attempt_from(&[("NEXTEST_ATTEMPT", "2")]).is_none(),
+            "the last attempt cannot be told without the total"
+        );
+        assert!(
+            RunEnv::from_lookup(|_| None)
+                .and_then(|run| run.runner_attempt("integration"))
+                .is_none(),
+            "plain cargo test has no attempt of a run"
+        );
     }
 
     #[cfg(unix)]

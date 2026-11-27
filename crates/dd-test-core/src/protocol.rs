@@ -33,9 +33,28 @@ pub struct Hello {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bootstrap {
     pub repo_root: Option<String>,
+    pub runner_attempt: Option<RunnerAttempt>,
     pub auto_test_retries: Option<AutoTestRetries>,
     pub early_flake_detection: Option<EarlyFlakeDetection>,
     pub test_management: Option<TestManagement>,
+}
+
+/// The attempt of an outer test runner, such as `cargo nextest run --retries`,
+/// which runs every attempt in a new process. Attempts are numbered from 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunnerAttempt {
+    pub number: u32,
+    pub total: u32,
+    /// The test the runner scheduled in this process, which may run others.
+    pub test: TestId,
+}
+
+impl RunnerAttempt {
+    pub fn new(number: u32, total: u32, test: TestId) -> Option<RunnerAttempt> {
+        (1..=total)
+            .contains(&number)
+            .then_some(RunnerAttempt { number, total, test })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +187,16 @@ impl Message {
                 let mut body = vec![("version", n(VERSION as f64))];
                 if let Some(root) = &b.repo_root {
                     body.push(("repo_root", s(root)));
+                }
+                if let Some(attempt) = &b.runner_attempt {
+                    body.push((
+                        "runner_attempt",
+                        Value::object([
+                            ("number", n(attempt.number as f64)),
+                            ("total", n(attempt.total as f64)),
+                            ("test", pair(&attempt.test)),
+                        ]),
+                    ));
                 }
                 if let Some(atr) = b.auto_test_retries {
                     body.push((
@@ -328,6 +357,13 @@ impl Message {
                 });
                 Message::Bootstrap(Bootstrap {
                     repo_root: str_field("repo_root"),
+                    runner_attempt: value.get("runner_attempt").and_then(|a| {
+                        RunnerAttempt::new(
+                            num(a, "number") as u32,
+                            num(a, "total") as u32,
+                            decode_pair(a.get("test")?)?,
+                        )
+                    }),
                     auto_test_retries: atr,
                     early_flake_detection: efd,
                     test_management: tm,
@@ -417,6 +453,11 @@ mod tests {
         }));
         round_trip(Message::Bootstrap(Bootstrap {
             repo_root: Some("/repo".into()),
+            runner_attempt: Some(RunnerAttempt {
+                number: 2,
+                total: 3,
+                test: ("s".to_string(), "r".to_string()),
+            }),
             auto_test_retries: Some(AutoTestRetries {
                 retries: 5,
                 budget: 1000,

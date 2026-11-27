@@ -177,6 +177,7 @@ impl AgentSession {
             None => Bootstrap::default(),
         };
         bootstrap.repo_root = Some(repo_root.to_string_lossy().to_string());
+        bootstrap.runner_attempt = nextest::runner_attempt(hello);
 
         let working_directory = relative_directory(&repo_root, &working_dir);
         let metadata = Metadata {
@@ -617,6 +618,7 @@ fn load_features(
     };
     Bootstrap {
         repo_root: None,
+        runner_attempt: None,
         auto_test_retries,
         early_flake_detection,
         test_management,

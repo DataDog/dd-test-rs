@@ -5,8 +5,8 @@ use crate::backend::Backend;
 use crate::ids::{new_id, now_nanos};
 use crate::panic as panics;
 use crate::protocol::{
-    AutoTestRetries, Bootstrap, EarlyFlakeDetection, ErrorInfo, Finish, Hello, Status, TestId, TestManagement,
-    TestProperties, TestRecord,
+    AutoTestRetries, Bootstrap, EarlyFlakeDetection, ErrorInfo, Finish, Hello, RunnerAttempt, Status, TestId,
+    TestManagement, TestProperties, TestRecord,
 };
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -67,6 +67,7 @@ struct Summary {
 pub struct Session {
     backend: Box<dyn Backend>,
     repo_root: Option<PathBuf>,
+    runner_attempt: Option<RunnerAttempt>,
     auto_test_retries: Option<AutoTestRetries>,
     atr_admitted: AtomicU32,
     efd: Option<EarlyFlakeDetection>,
@@ -84,6 +85,7 @@ impl Session {
         panics::install_hook();
         Ok(Session {
             repo_root: bootstrap.repo_root.map(PathBuf::from),
+            runner_attempt: bootstrap.runner_attempt,
             atr_admitted: AtomicU32::new(0),
             auto_test_retries: bootstrap.auto_test_retries,
             efd: bootstrap.early_flake_detection,
@@ -194,6 +196,8 @@ impl Session {
             _ => Mode::Normal,
         };
         let quarantined = props.quarantined && !matches!(mode, Mode::AttemptToFix(_));
+        let runner_attempt = self.runner_attempt.as_ref().filter(|attempt| attempt.test == plan.id);
+        let runner_retry = runner_attempt.is_some_and(|attempt| attempt.number > 1);
 
         let mut executions = 0u32;
         let mut any_pass = false;
@@ -239,6 +243,9 @@ impl Session {
             if executions > 1 {
                 tags.insert("test.is_retry".into(), "true".into());
                 tags.insert("test.retry_reason".into(), mode.retry_reason().into());
+            } else if runner_retry {
+                tags.insert("test.is_retry".into(), "true".into());
+                tags.insert("test.retry_reason".into(), EXTERNAL_RETRY_REASON.into());
             }
             if mode == Mode::EarlyFlakeDetection && executions == 1 && efd_max_executions == 0 {
                 tags.insert("test.early_flake.abort_reason".into(), "slow".into());
@@ -258,19 +265,26 @@ impl Session {
                 Mode::AttemptToFix(_) => !any_fail,
                 _ => any_pass || quarantined,
             };
+            let outcome = if verdict { Status::Pass } else { Status::Fail };
+            let is_final = match runner_attempt {
+                Some(attempt) => verdict || attempt.number >= attempt.total,
+                None => true,
+            };
             if !retry {
                 let tags = &mut record.tags;
-                if executions > 1 && !any_pass {
+                if is_final && executions > 1 && !any_pass {
                     tags.insert("test.has_failed_all_retries".into(), "true".into());
                 }
                 if matches!(mode, Mode::AttemptToFix(_)) {
+                    // The runner retries only a failed attempt, so an earlier attempt of this test failed.
                     tags.insert(
                         "test.test_management.attempt_to_fix_passed".into(),
-                        (!any_fail).to_string(),
+                        (!any_fail && !runner_retry).to_string(),
                     );
                 }
-                let outcome = if verdict { Status::Pass } else { Status::Fail };
-                tags.insert("test.final_status".into(), outcome.as_str().into());
+                if is_final {
+                    tags.insert("test.final_status".into(), outcome.as_str().into());
+                }
                 record.outcome = Some(outcome);
             }
 
@@ -355,6 +369,9 @@ enum Mode {
     EarlyFlakeDetection,
     AttemptToFix(u32),
 }
+
+/// The retry reason of an execution the outer runner retried.
+const EXTERNAL_RETRY_REASON: &str = "external";
 
 impl Mode {
     fn retry_reason(self) -> &'static str {
@@ -595,6 +612,45 @@ mod tests {
         }
     }
 
+    fn retry_attempt(number: u32, total: u32) -> Bootstrap {
+        attempt_of(number, total, "flaky")
+    }
+
+    /// A runner that scheduled `test` in this process, at the given attempt.
+    fn attempt_of(number: u32, total: u32, test: &str) -> Bootstrap {
+        Bootstrap {
+            runner_attempt: Some(RunnerAttempt {
+                number,
+                total,
+                test: ("c".to_string(), test.to_string()),
+            }),
+            ..Bootstrap::default()
+        }
+    }
+
+    /// Runs one test, one execution per entry of `results`, and returns the records it reported.
+    fn executions(bootstrap: Bootstrap, results: &[bool]) -> Vec<TestRecord> {
+        let recorder = Arc::new(Recorder {
+            bootstrap,
+            ..Recorder::default()
+        });
+        let session = Session::start(&hello(), Box::new(Arc::clone(&recorder))).unwrap();
+        let test = info("flaky");
+        let plan = session.plan(std::slice::from_ref(&test)).remove(0);
+        let mut calls = 0;
+        let _ = session.run(&test, &plan, true, &mut || {
+            let passed = results[calls];
+            calls += 1;
+            if passed {
+                Ok(Ok(()))
+            } else {
+                Ok(Err("fails".into()))
+            }
+        });
+        let records = recorder.records.lock().unwrap().clone();
+        records
+    }
+
     #[test]
     fn auto_test_retries_stop_at_the_first_pass() {
         let recorder = Arc::new(Recorder {
@@ -749,5 +805,141 @@ mod tests {
         let session = Session::start(&hello(), Box::new(Arc::clone(&recorder))).unwrap();
         let plans = session.plan(&few);
         assert!(!plans[0].is_new && plans[1].is_new);
+    }
+
+    #[test]
+    fn a_run_without_a_runner_finalizes_the_last_execution() {
+        let bootstrap = Bootstrap {
+            auto_test_retries: Some(AutoTestRetries { retries: 1, budget: 10 }),
+            ..Bootstrap::default()
+        };
+        let records = executions(bootstrap, &[false, true]);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].tags.get("test.final_status"), None);
+        assert_eq!(records[0].outcome, None);
+        assert_eq!(records[1].tags["test.final_status"], "pass");
+        assert_eq!(records[1].outcome, Some(Status::Pass));
+    }
+
+    #[test]
+    fn a_failed_attempt_that_the_runner_retries_is_not_final() {
+        let records = executions(retry_attempt(1, 3), &[false]);
+        assert_eq!(records[0].tags["test.status"], "fail");
+        assert_eq!(records[0].tags.get("test.final_status"), None);
+        assert_eq!(records[0].tags.get("test.is_retry"), None);
+        assert_eq!(records[0].tags.get("test.has_failed_all_retries"), None);
+        assert_eq!(records[0].outcome, Some(Status::Fail));
+    }
+
+    #[test]
+    fn a_passing_attempt_that_the_runner_retried_is_an_external_retry() {
+        let records = executions(retry_attempt(2, 3), &[true]);
+        assert_eq!(records[0].tags["test.status"], "pass");
+        assert_eq!(records[0].tags["test.is_retry"], "true");
+        assert_eq!(records[0].tags["test.retry_reason"], "external");
+        assert_eq!(records[0].tags["test.final_status"], "pass");
+    }
+
+    #[test]
+    fn the_last_attempt_that_the_runner_runs_is_final() {
+        let records = executions(retry_attempt(3, 3), &[false]);
+        assert_eq!(records[0].tags["test.is_retry"], "true");
+        assert_eq!(records[0].tags["test.retry_reason"], "external");
+        assert_eq!(records[0].tags["test.final_status"], "fail");
+    }
+
+    #[test]
+    fn datadog_retries_inside_a_retried_attempt_keep_their_reason() {
+        let bootstrap = |number| Bootstrap {
+            auto_test_retries: Some(AutoTestRetries { retries: 1, budget: 10 }),
+            ..retry_attempt(number, 3)
+        };
+
+        let passed = executions(bootstrap(2), &[false, true]);
+        assert_eq!(passed.len(), 2);
+        assert_eq!(passed[0].tags["test.retry_reason"], "external");
+        assert_eq!(passed[0].tags.get("test.final_status"), None);
+        assert_eq!(passed[1].tags["test.retry_reason"], "auto_test_retry");
+        assert_eq!(passed[1].tags["test.final_status"], "pass");
+        assert_eq!(passed[1].tags.get("test.has_failed_all_retries"), None);
+
+        let retried = executions(bootstrap(1), &[false, false]);
+        assert_eq!(retried.len(), 2);
+        assert_eq!(retried[1].tags["test.retry_reason"], "auto_test_retry");
+        assert_eq!(
+            retried[1].tags.get("test.final_status"),
+            None,
+            "the runner retries the attempt"
+        );
+        assert_eq!(retried[1].tags.get("test.has_failed_all_retries"), None);
+
+        let exhausted = executions(bootstrap(3), &[false, false]);
+        assert_eq!(exhausted[1].tags["test.has_failed_all_retries"], "true");
+        assert_eq!(exhausted[1].tags["test.final_status"], "fail");
+    }
+
+    #[test]
+    fn a_suppressed_failure_is_final_on_the_attempt_that_reports_it() {
+        let bootstrap = Bootstrap {
+            test_management: Some(TestManagement {
+                attempt_to_fix_retries: 0,
+                tests: [(
+                    ("c".to_string(), "flaky".to_string()),
+                    TestProperties {
+                        quarantined: true,
+                        ..TestProperties::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..retry_attempt(1, 3)
+        };
+        let records = executions(bootstrap, &[false]);
+        assert_eq!(records[0].tags["test.failure_suppression_reason"], "quarantine");
+        assert_eq!(records[0].tags["test.final_status"], "pass");
+        assert_eq!(records[0].outcome, Some(Status::Pass));
+    }
+
+    #[test]
+    fn attempt_to_fix_never_passes_on_an_attempt_that_the_runner_retried() {
+        let properties = TestProperties {
+            attempt_to_fix: true,
+            ..TestProperties::default()
+        };
+        let bootstrap = |number| Bootstrap {
+            test_management: Some(TestManagement {
+                attempt_to_fix_retries: 1,
+                tests: [(("c".to_string(), "flaky".to_string()), properties)]
+                    .into_iter()
+                    .collect(),
+            }),
+            ..retry_attempt(number, 2)
+        };
+
+        let first = executions(bootstrap(1), &[true, true]);
+        assert_eq!(first[1].tags["test.test_management.attempt_to_fix_passed"], "true");
+
+        let failed = executions(bootstrap(1), &[false]);
+        assert_eq!(failed[0].tags["test.test_management.attempt_to_fix_passed"], "false");
+        assert_eq!(
+            failed[0].tags.get("test.final_status"),
+            None,
+            "nextest retries the failure"
+        );
+
+        let retried = executions(bootstrap(2), &[true, true]);
+        assert_eq!(retried[1].tags["test.test_management.attempt_to_fix_passed"], "false");
+        assert_eq!(retried[1].tags["test.final_status"], "pass");
+    }
+
+    #[test]
+    fn a_test_the_runner_did_not_schedule_behaves_as_without_an_attempt() {
+        for results in [&[true][..], &[false][..]] {
+            let without = executions(Bootstrap::default(), results);
+            let reported = executions(attempt_of(2, 3, "other"), results);
+            assert_eq!(reported[0].tags, without[0].tags, "{results:?}");
+            assert_eq!(reported[0].outcome, without[0].outcome, "{results:?}");
+        }
     }
 }

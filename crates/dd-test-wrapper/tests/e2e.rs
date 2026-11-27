@@ -411,23 +411,31 @@ fn ensure_time_disables_retries_and_report_time_keeps_them() {
     assert_eq!(tests_named(&recorded.events, "basic::tests::nested", "deep").len(), 3);
 }
 
+/// cargo-nextest is required in CI and optional on a developer machine.
+fn has_nextest(test: &str) -> bool {
+    let version = cargo().args(["nextest", "--version"]).output();
+    if version.as_ref().is_ok_and(|output| output.status.success()) {
+        return true;
+    }
+    let reason = match &version {
+        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "cargo-nextest must be installed in CI: {reason}"
+    );
+    eprintln!("skipping {test}: cargo-nextest is not installed: {reason}");
+    false
+}
+
 #[test]
 fn nextest_reports_one_session_for_the_run() {
-    let version = cargo().args(["nextest", "--version"]).output();
-    if !version.as_ref().is_ok_and(|output| output.status.success()) {
-        let reason = match &version {
-            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "cargo-nextest must be installed in CI: {reason}"
-        );
-        eprintln!("skipping nextest_reports_one_session_for_the_run: cargo-nextest is not installed: {reason}");
+    if !has_nextest("nextest_reports_one_session_for_the_run") {
         return;
     }
     let run = run_fixture(
-        &["nextest", "run", "--no-fail-fast", "--retries", "1"],
+        &["nextest", "run", "--no-fail-fast", "--retries", "2"],
         &[
             ("DD_CIVISIBILITY_FLAKY_RETRY_ENABLED", "false"),
             ("DD_TEST_MANAGEMENT_ENABLED", "false"),
@@ -517,10 +525,22 @@ fn nextest_reports_one_session_for_the_run() {
             "{}",
             meta(session, "test.command")
         );
+        let flaky = tests_named(events, "basic::tests", "flaky_once");
         assert_eq!(
-            tests_named(events, "basic::tests", "flaky_once").len(),
+            flaky.len(),
             2,
-            "one event per attempt"
+            "one event per attempt, in the order the intake received them"
+        );
+        assert_eq!(meta(flaky[0], "test.status"), "fail");
+        assert_eq!(meta(flaky[0], "test.is_retry"), "", "the first attempt is not a retry");
+        assert_eq!(meta(flaky[0], "test.final_status"), "", "nextest retries the failure");
+        assert_eq!(meta(flaky[1], "test.status"), "pass");
+        assert_eq!(meta(flaky[1], "test.is_retry"), "true");
+        assert_eq!(meta(flaky[1], "test.retry_reason"), "external");
+        assert_eq!(
+            meta(flaky[1], "test.final_status"),
+            "pass",
+            "the attempt passes before the last of the three nextest allows"
         );
     }
 
@@ -561,6 +581,104 @@ fn nextest_reports_one_session_for_the_run() {
         .collect();
     ended.sort_unstable();
     assert_eq!(ended, suites, "one suite end per suite, with no duplicate");
+}
+
+#[test]
+fn nextest_finalizes_the_last_attempt_of_a_test_that_keeps_failing() {
+    if !has_nextest("nextest_finalizes_the_last_attempt_of_a_test_that_keeps_failing") {
+        return;
+    }
+    let run = run_fixture(
+        &[
+            "nextest",
+            "run",
+            "--no-fail-fast",
+            "--retries",
+            "1",
+            "--lib",
+            "flaky_once",
+        ],
+        &[
+            ("DD_CIVISIBILITY_FLAKY_RETRY_ENABLED", "false"),
+            ("DD_TEST_MANAGEMENT_ENABLED", "false"),
+            ("BASIC_FLAKY_FAILURES", "10"),
+        ],
+    );
+    let nextest_output = String::from_utf8_lossy(&run.output.stderr).to_string();
+    assert!(
+        !run.output.status.success(),
+        "flaky_once fails every attempt:\n{nextest_output}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while events_of(&run.recorded.lock().unwrap().events, "test_session_end").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "nextest exits before the finalizer reports the session:\n{nextest_output}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let recorded = run.recorded.lock().unwrap();
+    let flaky = tests_named(&recorded.events, "basic::tests", "flaky_once");
+    assert_eq!(
+        flaky.len(),
+        2,
+        "one event per attempt, in the order the intake received them"
+    );
+    assert_eq!(meta(flaky[0], "test.status"), "fail");
+    assert_eq!(meta(flaky[0], "test.is_retry"), "");
+    assert_eq!(meta(flaky[0], "test.final_status"), "", "nextest retries the failure");
+    assert_eq!(meta(flaky[1], "test.status"), "fail");
+    assert_eq!(meta(flaky[1], "test.is_retry"), "true");
+    assert_eq!(meta(flaky[1], "test.retry_reason"), "external");
+    assert_eq!(meta(flaky[1], "test.final_status"), "fail");
+    assert_eq!(
+        meta(flaky[1], "test.has_failed_all_retries"),
+        "",
+        "Auto Test Retries are off, so an attempt runs the test once"
+    );
+}
+
+#[test]
+fn nextest_reports_tests_beside_the_scheduled_one_as_first_executions() {
+    if !has_nextest("nextest_reports_tests_beside_the_scheduled_one_as_first_executions") {
+        return;
+    }
+    let run = run_fixture(
+        &[
+            "nextest",
+            "run",
+            "--retries",
+            "1",
+            "--lib",
+            "flaky_once",
+            "--config-file",
+            "nextest-extra-args.toml",
+        ],
+        &[
+            ("DD_CIVISIBILITY_FLAKY_RETRY_ENABLED", "false"),
+            ("DD_TEST_MANAGEMENT_ENABLED", "false"),
+        ],
+    );
+    let nextest_output = String::from_utf8_lossy(&run.output.stderr).to_string();
+    assert!(
+        run.output.status.success(),
+        "flaky_once passes on its second attempt:\n{nextest_output}"
+    );
+
+    let recorded = run.recorded.lock().unwrap();
+    let flaky = tests_named(&recorded.events, "basic::tests", "flaky_once");
+    assert_eq!(flaky.len(), 2, "one event per attempt");
+    assert_eq!(meta(flaky[1], "test.retry_reason"), "external");
+
+    let extra = tests_named(&recorded.events, "basic::tests", "passes");
+    assert_eq!(extra.len(), 2, "libtest runs it in both attempts");
+    for event in extra {
+        assert_eq!(meta(event, "test.is_retry"), "", "nextest did not schedule it");
+        assert_eq!(meta(event, "test.retry_reason"), "");
+        assert_eq!(meta(event, "test.final_status"), "pass");
+    }
 }
 
 #[test]
